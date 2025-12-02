@@ -107,7 +107,9 @@ mvn exec:java \                                                                 
                --csv ./cisco_baseline_500gbps.csv.gz \
                --total-events 1000 \
                --num-senders 1 \
-               --delay-ms 0"
+               --delay-ms 0 \
+               --timestamp-from-file false \
+               --retry-timeout 360000"
 ```
 
 Data originally from https://github.com/javier/cisco-ie-telemetry/tree/master

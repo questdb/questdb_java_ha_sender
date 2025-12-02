@@ -138,6 +138,7 @@ public class TelemetryParallelSender {
             }
         }
         System.out.println("All workers completed.");
+        System.exit(0);
     }
 
     private static void runWorker(
