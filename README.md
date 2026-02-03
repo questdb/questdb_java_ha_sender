@@ -17,3 +17,6 @@ java -jar target/ilp_sender-1.0-SNAPSHOT.jar \
 --timestamp-from-file false \
 --retry-timeout 360000
 ```
+
+
+For a similar sender, but for telemetry data, see the instructions (and license info) at [the Telemetry Readme](./TelemetryReadme.md)

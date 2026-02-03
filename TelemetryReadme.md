@@ -112,4 +112,6 @@ mvn exec:java \                                                                 
                --retry-timeout 360000"
 ```
 
-Data originally from https://github.com/javier/cisco-ie-telemetry/tree/master
+Data originally from https://github.com/javier/cisco-ie-telemetry/tree/master.
+The data is under the [Community Data License Agreement – Permissive, Version 1.0
+](https://cdla.dev/permissive-1-0/)
