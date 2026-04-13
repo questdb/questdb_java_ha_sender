@@ -31,6 +31,7 @@ public class CsvParallelSender {
     private static final int DEFAULT_RETRY_TIMEOUT = 360000;
     private static final String DEFAULT_CSV = "./trades20250728.csv.gz";
     private static final boolean DEFAULT_TIMESTAMP_FROM_FILE = false;
+    private static final long DEFAULT_SECONDS_OFFSET = 0L;
 
     public static void main(String[] args) throws Exception {
         // Parse CLI flags
@@ -47,6 +48,8 @@ public class CsvParallelSender {
         final String csvPath = a.getOrDefault("--csv", DEFAULT_CSV);
         final boolean timestampFromFile = Boolean.parseBoolean(a.getOrDefault("--timestamp-from-file",
                 String.valueOf(DEFAULT_TIMESTAMP_FROM_FILE)));
+        final long secondsOffset = Long.parseLong(a.getOrDefault("--seconds-offset",
+                String.valueOf(DEFAULT_SECONDS_OFFSET)));
 
         if (!Files.exists(Path.of(csvPath))) {
             System.err.println("CSV file not found: " + csvPath);
@@ -81,7 +84,7 @@ public class CsvParallelSender {
             final long eventsForThis = base + (id < rem ? 1 : 0);
             final int senderId = id;
             //futures.add(exec.submit(() -> runWorker(senderId, eventsForThis, delayMs, timestampFromFile, rows, conf)));
-            futures.add(exec.submit(() -> runWorker(senderId, eventsForThis, delayMs, timestampFromFile, rows, builder)));
+            futures.add(exec.submit(() -> runWorker(senderId, eventsForThis, delayMs, timestampFromFile, secondsOffset, rows, builder)));
         }
 
         // Wait for completion
@@ -102,9 +105,9 @@ public class CsvParallelSender {
             long totalEvents,
             int delayMs,
             boolean timestampFromFile,
+            long secondsOffset,
             List<TradeRow> rows,
             LineSenderBuilder builder
-            //String conf
     ) {
         System.out.printf("Sender %d will send %d events%n", senderId, totalEvents);
         long sent = 0;
@@ -122,7 +125,12 @@ public class CsvParallelSender {
 
                 if (timestampFromFile) {
                     Instant ts = Instant.parse(r.timestamp);
+                    if (secondsOffset != 0) {
+                        ts = ts.plusSeconds(secondsOffset);
+                    }
                     sender.at(ts);
+                } else if (secondsOffset != 0) {
+                    sender.at(Instant.now().plusSeconds(secondsOffset));
                 } else {
                     sender.atNow();
                 }
@@ -279,6 +287,7 @@ public class CsvParallelSender {
                 case "--num-senders":
                 case "--csv":
                 case "--timestamp-from-file":
+                case "--seconds-offset":
                 case "--retry-timeout":
                     if (i + 1 >= args.length) {
                         throw new IllegalArgumentException("Missing value for " + k);

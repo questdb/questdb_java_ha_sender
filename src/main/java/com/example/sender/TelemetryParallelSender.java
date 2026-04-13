@@ -34,6 +34,7 @@ public class TelemetryParallelSender {
     // New default CSV for Cisco baseline
     private static final String DEFAULT_CSV = "./cisco_baseline_500gbps.csv";
     private static final boolean DEFAULT_TIMESTAMP_FROM_FILE = false;
+    private static final long DEFAULT_SECONDS_OFFSET = 0L;
 
     // Column classification
     private static final String TIMESTAMP_COLUMN = "time";
@@ -70,6 +71,8 @@ public class TelemetryParallelSender {
         final boolean timestampFromFile = Boolean.parseBoolean(a.getOrDefault(
                 "--timestamp-from-file",
                 String.valueOf(DEFAULT_TIMESTAMP_FROM_FILE)));
+        final long secondsOffset = Long.parseLong(a.getOrDefault("--seconds-offset",
+                String.valueOf(DEFAULT_SECONDS_OFFSET)));
 
         if (!Files.exists(Path.of(csvPath))) {
             System.err.println("CSV file not found: " + csvPath);
@@ -123,8 +126,8 @@ public class TelemetryParallelSender {
             final long eventsForThis = base + (id < rem ? 1 : 0);
             final int senderId = id;
             futures.add(exec.submit(
-                    () -> runWorker(senderId, eventsForThis, delayMs, timestampFromFile, timeIndex, header, rows,
-                            builder)));
+                    () -> runWorker(senderId, eventsForThis, delayMs, timestampFromFile, secondsOffset, timeIndex,
+                            header, rows, builder)));
         }
 
         // Wait for completion
@@ -146,6 +149,7 @@ public class TelemetryParallelSender {
             long totalEvents,
             int delayMs,
             boolean timestampFromFile,
+            long secondsOffset,
             int timeIndex,
             String[] header,
             List<String[]> rows,
@@ -212,10 +216,15 @@ public class TelemetryParallelSender {
                     String t = csvRow[timeIndex];
                     if (!isEmpty(t)) {
                         Instant ts = Instant.parse(t.trim());
+                        if (secondsOffset != 0) {
+                            ts = ts.plusSeconds(secondsOffset);
+                        }
                         sender.at(ts);
                     } else {
                         sender.atNow();
                     }
+                } else if (secondsOffset != 0) {
+                    sender.at(Instant.now().plusSeconds(secondsOffset));
                 } else {
                     // Default: server timestamp
                     sender.atNow();
@@ -385,6 +394,7 @@ public class TelemetryParallelSender {
                 case "--num-senders":
                 case "--csv":
                 case "--timestamp-from-file":
+                case "--seconds-offset":
                 case "--retry-timeout":
                     if (i + 1 >= args.length) {
                         throw new IllegalArgumentException("Missing value for " + k);
