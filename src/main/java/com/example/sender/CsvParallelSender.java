@@ -2,10 +2,16 @@ package com.example.sender;
 
 import io.questdb.client.Sender;
 import io.questdb.client.Sender.LineSenderBuilder;
+import io.questdb.client.SenderConnectionListener;
+import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
+import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
+import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
+import io.questdb.client.cutlass.qwp.client.QwpServerInfo;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -43,6 +49,12 @@ public class CsvParallelSender {
     // by an explicit flush(). See buildSender()/runWorker().
     private static final int DEFAULT_BATCH_SIZE = 10_000;
     private static final int DEFAULT_BATCHES_PER_TRANSACTION = 10;
+    // Probe (QWP only): poll the latest ingested timestamp on an interval, 0 disables.
+    private static final long DEFAULT_PROBE_INTERVAL_MS = 1000L;
+    private static final String PROBE_QUERY = "select timestamp from trades limit -1";
+    // Zone for the query client (egress). Biases failover toward same-zone instances on
+    // Enterprise; a no-op on OSS (which advertises no zone). Empty omits the key.
+    private static final String DEFAULT_ZONE = "eu-west-1";
 
     // Rows sent (client-side) across all workers, for the once-per-second progress reporter.
     private static final AtomicLong TOTAL_SENT = new AtomicLong();
@@ -70,9 +82,19 @@ public class CsvParallelSender {
         final int batchSize = Integer.parseInt(a.getOrDefault("--batch-size", String.valueOf(DEFAULT_BATCH_SIZE)));
         final int batchesPerTransaction = Integer.parseInt(a.getOrDefault("--batches-per-transaction",
                 String.valueOf(DEFAULT_BATCHES_PER_TRANSACTION)));
+        final long probeIntervalMs = Long.parseLong(a.getOrDefault("--probe-interval-ms",
+                String.valueOf(DEFAULT_PROBE_INTERVAL_MS)));
+        // Enterprise-only: request durable acks (data durably uploaded). OSS servers do not
+        // support it and the connection is rejected, so it is off by default.
+        final boolean enterprise = Boolean.parseBoolean(a.getOrDefault("--enterprise", "false"));
+        final String zone = a.getOrDefault("--zone", DEFAULT_ZONE);
 
         if (!protocol.equals("qwp") && !protocol.equals("ilp")) {
             System.err.println("--protocol must be 'qwp' or 'ilp', got: " + protocol);
+            System.exit(2);
+        }
+        if (probeIntervalMs < 0) {
+            System.err.println("--probe-interval-ms must be >= 0 (0 disables the probe)");
             System.exit(2);
         }
         if (batchSize <= 0) {
@@ -98,7 +120,7 @@ public class CsvParallelSender {
         }
 
         final SenderCfg cfg = new SenderCfg(protocol, addrsCsv, token, username, password, retryTimeout,
-                senderIdBase, storeForwardDir, batchSize, batchesPerTransaction, numSenders);
+                senderIdBase, storeForwardDir, batchSize, batchesPerTransaction, numSenders, enterprise, zone);
 
         final String conf = buildConf(addrsCsv, token, username, password, retryTimeout);
         System.out.println("Ingestion started. Protocol: " + protocol
@@ -140,6 +162,12 @@ public class CsvParallelSender {
         reporter.setDaemon(true);
         reporter.start();
 
+        // Probe (QWP only): a separate thread polls the latest ingested timestamp over a
+        // QWP query client. Same hosts/auth as the senders; it fails over automatically.
+        final Thread probe = (protocol.equals("qwp") && probeIntervalMs > 0)
+                ? startProbe(cfg, probeIntervalMs)
+                : null;
+
         for (int id = 0; id < numSenders; id++) {
             final long eventsForThis = base + (id < rem ? 1 : 0);
             final int senderId = id;
@@ -158,6 +186,9 @@ public class CsvParallelSender {
             }
         }
         reporter.interrupt();
+        if (probe != null) {
+            probe.interrupt();
+        }
         final double elapsedSec = (System.nanoTime() - startNanos) / 1_000_000_000.0;
         final double rowsPerSec = elapsedSec > 0 ? totalEvents / elapsedSec : 0;
         System.out.printf("All workers completed. protocol=%s events=%d elapsed=%.3f s throughput=%,.0f rows/s%n",
@@ -367,9 +398,55 @@ public class CsvParallelSender {
                     who, sfPath, e.getMessage());
         }
 
+        // Narrate connection state changes so a host going down and the failover to the
+        // next host in --addrs is visible on stdout.
+        final SenderConnectionListener connListener = event -> {
+            final String host = event.getHost() + ":" + event.getPort();
+            final String cause = event.getCause() != null
+                    ? String.valueOf(event.getCause().getMessage()) : "no detail";
+            switch (event.getKind()) {
+                case CONNECTED:
+                    System.out.printf("[ingestion client %s] connected to %s%n", who, host);
+                    break;
+                case DISCONNECTED:
+                    System.out.printf("[ingestion client %s] connection lost to %s (%s), will retry%n",
+                            who, host, cause);
+                    break;
+                case ENDPOINT_ATTEMPT_FAILED:
+                    System.out.printf("[ingestion client %s] endpoint %s failed (%s), trying next%n",
+                            who, host, cause);
+                    break;
+                case FAILED_OVER:
+                    System.out.printf("[ingestion client %s] failed over %s:%d -> %s%n",
+                            who, event.getPreviousHost(), event.getPreviousPort(), host);
+                    break;
+                case RECONNECTED:
+                    System.out.printf("[ingestion client %s] reconnected to %s%n", who, host);
+                    break;
+                case ALL_ENDPOINTS_UNREACHABLE:
+                    System.out.printf("[ingestion client %s] all endpoints unreachable, backing off%n", who);
+                    break;
+                case AUTH_FAILED:
+                    System.out.printf("[ingestion client %s] auth failed for %s%n", who, host);
+                    break;
+                case RECONNECT_BUDGET_EXHAUSTED:
+                    System.out.printf("[ingestion client %s] reconnect budget exhausted, giving up%n", who);
+                    break;
+                default:
+                    System.out.printf("[ingestion client %s] %s host=%s%n", who, event.getKind(), host);
+            }
+        };
+
+        // Enterprise-only: hold spilled frames until a durable (committed) ack. OSS servers
+        // reject this during the WebSocket upgrade, so it is gated behind --enterprise.
+        if (cfg.enterprise) {
+            b.requestDurableAck(true);
+        }
+
         return b.storeAndForwardDir(sfPath)
                 .senderId(who)
                 .transactional(true)
+                .connectionListener(connListener)
                 .reconnectMaxDurationMillis(300_000)
                 .reconnectInitialBackoffMillis(100)
                 .reconnectMaxBackoffMillis(5_000)
@@ -377,6 +454,119 @@ public class CsvParallelSender {
                 .autoFlushRows(cfg.batchSize)         // one batch = one deferred append
                 .autoFlushIntervalMillis(1_000)
                 .build();
+    }
+
+    // Config string for the QWP query client: same hosts and token/auth as the senders,
+    // ws/wss chosen the same way (TLS on when token/basic auth is present), failover on
+    // for more than one host. Matches the reference project's queryClientConfig().
+    private static String queryClientConfig(SenderCfg cfg) {
+        String[] addrs = Arrays.stream(cfg.addrsCsv.split(","))
+                .map(String::trim)
+                .filter(s -> !s.isEmpty())
+                .toArray(String[]::new);
+
+        boolean hasToken = cfg.token != null && !cfg.token.isEmpty();
+        boolean hasBasic = cfg.username != null && !cfg.username.isEmpty()
+                && cfg.password != null && !cfg.password.isEmpty();
+        boolean tls = hasToken || hasBasic;
+
+        StringBuilder sb = new StringBuilder(tls ? "wss" : "ws")
+                .append("::addr=").append(String.join(",", addrs)).append(';');
+        if (hasToken) {
+            sb.append("token=").append(cfg.token).append(';');
+        } else if (hasBasic) {
+            sb.append("username=").append(cfg.username).append(';')
+              .append("password=").append(cfg.password).append(';');
+        }
+        if (tls) {
+            sb.append("tls_verify=unsafe_off;");
+        }
+        if (addrs.length > 1) {
+            sb.append("failover=on;");
+        }
+        if (cfg.zone != null && !cfg.zone.isEmpty()) {
+            sb.append("zone=").append(cfg.zone).append(';');
+        }
+        return sb.toString();
+    }
+
+    // Starts a daemon thread that polls the latest ingested timestamp over a QWP query
+    // client every intervalMs, printing to stdout. Independent of the senders. The client
+    // fails over across the configured hosts automatically; onFailoverReset reports hops.
+    private static Thread startProbe(SenderCfg cfg, long intervalMs) {
+        final Thread t = new Thread(() -> {
+            try (QwpQueryClient client = QwpQueryClient.fromConfig(queryClientConfig(cfg))) {
+                client.connect();
+                final QwpServerInfo info = client.getServerInfo();
+                if (info != null) {
+                    System.out.printf("[query client] connected, serving node=%s role=%s zone=%s cluster=%s%n",
+                            orNone(info.getNodeId()), QwpServerInfo.roleName(info.getRole()),
+                            orNone(info.getZoneId()), orNone(info.getClusterId()));
+                } else {
+                    System.out.println("[query client] connected");
+                }
+                final long[] latest = {Long.MIN_VALUE};
+                final boolean[] wasDown = {false};
+                final QwpColumnBatchHandler handler = new QwpColumnBatchHandler() {
+                    @Override
+                    public void onBatch(QwpColumnBatch batch) {
+                        batch.forEachRow(row -> {
+                            if (!row.isNull(0)) {
+                                latest[0] = row.getLongValue(0);
+                            }
+                        });
+                    }
+
+                    @Override
+                    public void onEnd(long totalRows) {
+                    }
+
+                    @Override
+                    public void onError(byte status, String message) {
+                        System.out.printf("[query client] server error: %s%n", message);
+                    }
+
+                    @Override
+                    public void onFailoverReset(QwpServerInfo info) {
+                        System.out.printf("[query client] failed over -> now serving node=%s role=%s zone=%s%n",
+                                orNone(info.getNodeId()), QwpServerInfo.roleName(info.getRole()), orNone(info.getZoneId()));
+                    }
+                };
+                while (!Thread.currentThread().isInterrupted()) {
+                    latest[0] = Long.MIN_VALUE;
+                    try {
+                        client.execute(PROBE_QUERY, handler);
+                        if (wasDown[0]) {
+                            System.out.println("[query client] connection restored");
+                            wasDown[0] = false;
+                        }
+                        if (latest[0] != Long.MIN_VALUE) {
+                            // trades designated timestamp is microseconds by default.
+                            Instant ts = Instant.EPOCH.plus(latest[0], ChronoUnit.MICROS);
+                            System.out.printf("[probe] latest trades timestamp = %s (raw=%d)%n", ts, latest[0]);
+                        }
+                    } catch (Exception e) {
+                        if (!wasDown[0]) {
+                            System.out.printf("[query client] connection lost (%s), will retry%n",
+                                    String.valueOf(e.getMessage()));
+                            wasDown[0] = true;
+                        }
+                    }
+                    Thread.sleep(intervalMs);
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            } catch (Exception e) {
+                System.err.println("[probe] stopped: " + e.getMessage());
+            }
+        }, "qwp-probe");
+        t.setDaemon(true);
+        t.start();
+        return t;
+    }
+
+    private static String orNone(String s) {
+        return (s == null || s.isEmpty()) ? "(none)" : s;
     }
 
     private static String buildConf(String addrsCsv, String token, String username, String password, int retryTimeout) {
@@ -433,6 +623,9 @@ public class CsvParallelSender {
                 case "--store-forward-dir":
                 case "--batch-size":
                 case "--batches-per-transaction":
+                case "--probe-interval-ms":
+                case "--enterprise":
+                case "--zone":
                     if (i + 1 >= args.length) {
                         throw new IllegalArgumentException("Missing value for " + k);
                     }
@@ -467,10 +660,12 @@ public class CsvParallelSender {
         final int batchSize;
         final int batchesPerTransaction;
         final int numSenders;
+        final boolean enterprise;
+        final String zone;
 
         SenderCfg(String protocol, String addrsCsv, String token, String username, String password,
                   int retryTimeout, String senderIdBase, String storeForwardDir,
-                  int batchSize, int batchesPerTransaction, int numSenders) {
+                  int batchSize, int batchesPerTransaction, int numSenders, boolean enterprise, String zone) {
             this.protocol = protocol;
             this.addrsCsv = addrsCsv;
             this.token = token;
@@ -482,6 +677,8 @@ public class CsvParallelSender {
             this.batchSize = batchSize;
             this.batchesPerTransaction = batchesPerTransaction;
             this.numSenders = numSenders;
+            this.enterprise = enterprise;
+            this.zone = zone;
         }
     }
 }

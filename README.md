@@ -59,6 +59,16 @@ QWP-only flags:
 - `--batches-per-transaction` (default `10`): an explicit `flush()` commits every
   `batch-size × batches-per-transaction` rows atomically per table. See
   [Commit cadence](#commit-cadence-freshness-vs-throughput) below.
+- `--probe-interval-ms` (default `1000`, `0` disables): interval for the probe thread
+  that polls the latest ingested timestamp. See [Probe](#probe-qwp-only) below.
+- `--enterprise` (default `false`): request durable acks (`requestDurableAck`), holding
+  spilled frames until the server confirms a durable commit. **Enterprise only**: an OSS
+  server rejects the WebSocket upgrade, so leave it off against OSS. See
+  [Failover and connection narration](#failover-and-connection-narration-qwp).
+- `--zone` (default `eu-west-1`): preferred zone for the **query client** (probe), added
+  to its connect string as `zone=`. Biases failover toward same-zone instances on
+  Enterprise; a no-op on OSS. The ingestion path is zone-blind (it must follow the
+  primary), so this does not affect the senders.
 
 ## Commit cadence (freshness vs throughput)
 
@@ -86,6 +96,70 @@ seconds between commits (per worker) = (batch-size × batches-per-transaction) /
 - **Real-time / low-rate:** the same large value means data can sit uncommitted (invisible)
   for many seconds. Keep `--batches-per-transaction` small when freshness matters more
   than raw throughput.
+
+## Probe (QWP only)
+
+When the transport is QWP, a separate thread polls the latest ingested timestamp and
+prints it to stdout once per `--probe-interval-ms` (default `1000` ms; `0` disables). It
+runs `select timestamp from trades limit -1` over a **QWP query client** and is fully
+independent of the senders, so it does not affect ingestion.
+
+```
+[probe] latest trades timestamp = 2026-07-01T14:31:40.591545Z (raw=1782916300591545)
+```
+
+The query client uses the **same host list and token/auth** as the senders and enables
+**failover** when more than one host is given (`ws|wss::addr=h1,h2,...;...;failover=on`), so
+if a host stops responding it moves to the next one automatically and narrates the
+transition (see [Failover and connection narration](#failover-and-connection-narration-qwp)).
+Before the `trades` table exists it prints `[query client] server error: table does not
+exist` each interval, then switches to timestamps once ingestion begins. ILP ignores
+`--probe-interval-ms`.
+
+On connect the probe prints the instance actually serving it:
+
+```
+[query client] connected, serving node=<nodeId> role=<primary|replica|standalone> zone=<zoneId> cluster=<clusterId>
+```
+
+On OSS `node`/`zone` are `(none)` (the server advertises neither); on Enterprise they
+identify the serving host and its zone. The preferred zone is set with `--zone` (default
+`eu-west-1`), added to the query client's connect string. `withTarget`
+(primary/replica/any) is available in the API but not wired to a flag yet.
+
+## Failover and connection narration (QWP)
+
+Pass more than one host in `--addrs` (comma-separated) and the QWP clients fail over across
+them automatically when a host stops responding. Both clients narrate the transitions on
+stdout so an outage and recovery are visible.
+
+The **ingestion client** (one per worker) reports connection-state changes via the client's
+`SenderConnectionListener`, prefixed `[ingestion client <sender-id>-<worker>]`:
+
+```
+[ingestion client ha_sender-0] connected to h1:9000
+[ingestion client ha_sender-0] connection lost to h1:9000 (...), will retry
+[ingestion client ha_sender-0] endpoint h1:9000 failed (...), trying next
+[ingestion client ha_sender-0] failed over h1:9000 -> h2:9000
+[ingestion client ha_sender-0] reconnected to h2:9000
+[ingestion client ha_sender-0] all endpoints unreachable, backing off
+```
+
+(also `auth failed` and `reconnect budget exhausted` terminal states.)
+
+The **query client** (the probe) reports, prefixed `[query client]`:
+
+```
+[query client] connection lost (...), will retry
+[query client] failed over -> node=<nodeId> role=<primary|replica> zone=<zoneId>
+[query client] connection restored
+```
+
+Durability note: `transactional(true)` and store-and-forward are plain OSS features and are
+always on for QWP. **Durable ack** (`--enterprise`) is the extra "durably persisted"
+confirmation, which only **QuestDB Enterprise** implements; an OSS server rejects it during
+the WebSocket upgrade (`server does not support durable ack`), which the ingestion client
+narrates as an `endpoint failed` and retries. Leave `--enterprise` off against OSS.
 
 ## Timestamps and throughput
 
