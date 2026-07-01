@@ -498,43 +498,57 @@ public class TelemetryParallelSender {
                     who, sfPath, e.getMessage());
         }
 
-        // Narrate connection state changes so a host going down and the failover to the
-        // next host in --addrs is visible on stdout.
+        // Narrate connection state changes so a host going down and the failover to the next
+        // host in --addrs is visible. The repetitive backoff events (disconnected / endpoint
+        // failed / all unreachable) are throttled to ~once every 3s so they do not bury the
+        // meaningful transitions (connected / failed over / reconnected) or the query client.
+        final long[] lastNoisyMs = {0L};
         final SenderConnectionListener connListener = event -> {
             final String host = event.getHost() + ":" + event.getPort();
             final String cause = event.getCause() != null
                     ? String.valueOf(event.getCause().getMessage()) : "no detail";
+            final String msg;
+            boolean noisy = false;
             switch (event.getKind()) {
                 case CONNECTED:
-                    System.out.printf("[ingestion client %s] connected to %s%n", who, host);
-                    break;
-                case DISCONNECTED:
-                    System.out.printf("[ingestion client %s] connection lost to %s (%s), will retry%n",
-                            who, host, cause);
-                    break;
-                case ENDPOINT_ATTEMPT_FAILED:
-                    System.out.printf("[ingestion client %s] endpoint %s failed (%s), trying next%n",
-                            who, host, cause);
-                    break;
-                case FAILED_OVER:
-                    System.out.printf("[ingestion client %s] failed over %s:%d -> %s%n",
-                            who, event.getPreviousHost(), event.getPreviousPort(), host);
+                    msg = "connected to " + host;
                     break;
                 case RECONNECTED:
-                    System.out.printf("[ingestion client %s] reconnected to %s%n", who, host);
+                    msg = "reconnected to " + host;
                     break;
-                case ALL_ENDPOINTS_UNREACHABLE:
-                    System.out.printf("[ingestion client %s] all endpoints unreachable, backing off%n", who);
+                case FAILED_OVER:
+                    msg = "failed over " + event.getPreviousHost() + ":" + event.getPreviousPort() + " -> " + host;
                     break;
                 case AUTH_FAILED:
-                    System.out.printf("[ingestion client %s] auth failed for %s%n", who, host);
+                    msg = "auth failed for " + host;
                     break;
                 case RECONNECT_BUDGET_EXHAUSTED:
-                    System.out.printf("[ingestion client %s] reconnect budget exhausted, giving up%n", who);
+                    msg = "reconnect budget exhausted, giving up";
+                    break;
+                case DISCONNECTED:
+                    msg = "connection lost to " + host + " (" + cause + "), will retry";
+                    noisy = true;
+                    break;
+                case ENDPOINT_ATTEMPT_FAILED:
+                    msg = "endpoint " + host + " failed (" + cause + "), trying next";
+                    noisy = true;
+                    break;
+                case ALL_ENDPOINTS_UNREACHABLE:
+                    msg = "all endpoints unreachable, backing off";
+                    noisy = true;
                     break;
                 default:
-                    System.out.printf("[ingestion client %s] %s host=%s%n", who, event.getKind(), host);
+                    msg = event.getKind() + " host=" + host;
+                    noisy = true;
             }
+            if (noisy) {
+                final long now = System.currentTimeMillis();
+                if (now - lastNoisyMs[0] < 3000L) {
+                    return;   // throttle repetitive backoff spam
+                }
+                lastNoisyMs[0] = now;
+            }
+            System.out.printf("[ingestion client %s] %s%n", who, msg);
         };
 
         // Enterprise-only: hold spilled frames until a durable (committed) ack. OSS servers
