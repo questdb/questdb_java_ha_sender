@@ -32,8 +32,8 @@ SERVERS_CSV="${1:-$DEFAULT_SERVERS}"          # first CLI arg overrides the defa
 
 TARGET_ROLE="primary"        # role to switch a node to on failover
 SWITCH_TIMEOUT_MS=5000       # timeout_ms in the switch payload
-FAIL_THRESHOLD=5             # consecutive health failures before failover
-CHECK_INTERVAL=2             # seconds between health checks
+FAIL_THRESHOLD=3             # consecutive health failures before failover
+CHECK_INTERVAL=1             # seconds between health checks
 STARTUP_RETRIES=3            # sweeps to find the initial primary before giving up
 SWITCH_RETRIES=3             # retries if a switch POST is not accepted
 SWITCH_POLL_INTERVAL=1       # seconds between lifecycle polls after a switch
