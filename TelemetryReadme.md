@@ -98,19 +98,37 @@ Compile
 mvn -DskipTests package
 ```
 
+The QuestDB client version is a Maven property (`questdb.client.version`, default
+`1.3.2`). For a server built from master, build with
+`-Dquestdb.client.version=1.3.5-SNAPSHOT`. See the main [README](./README.md) for details.
+
 Send data with
 
 ```bash
 mvn exec:java \                                                                                                                                                                                                                                                                 🙈
   -Dexec.mainClass=com.example.sender.TelemetryParallelSender \
-  -Dexec.args="--addrs localhost:9000 \
+  -Dexec.args="--protocol qwp \
+               --addrs localhost:9000 \
                --csv ./cisco_baseline_500gbps.csv.gz \
                --total-events 1000 \
                --num-senders 1 \
                --delay-ms 0 \
                --timestamp-from-file false \
-               --retry-timeout 360000"
+               --retry-timeout 360000 \
+               --sender-id ha_sender \
+               --store-forward-dir /tmp/qdb-sf \
+               --batch-size 10000 \
+               --batches-per-transaction 10"
 ```
+
+This sender takes the same transport and tuning flags as the trades sender:
+`--protocol qwp|ilp` (default `qwp`, QWP over WebSocket with store-and-forward), plus the
+QWP-only `--sender-id`, `--store-forward-dir`, `--batch-size`, and
+`--batches-per-transaction`. On completion it prints elapsed time and rows/s, and it logs
+progress once a second. With QWP and a single worker each row is stamped with the current
+microsecond client-side; ILP or multiple workers use `atNow()`. See the main
+[README](./README.md) for full descriptions of every flag, the commit cadence, timestamp
+behaviour, and throughput notes.
 
 Data originally from https://github.com/javier/cisco-ie-telemetry/tree/master.
 The data is under the [Community Data License Agreement – Permissive, Version 1.0

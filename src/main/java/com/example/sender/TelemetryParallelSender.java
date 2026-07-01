@@ -14,6 +14,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 import com.opencsv.CSVReader;
 
@@ -35,6 +36,16 @@ public class TelemetryParallelSender {
     private static final String DEFAULT_CSV = "./cisco_baseline_500gbps.csv";
     private static final boolean DEFAULT_TIMESTAMP_FROM_FILE = false;
     private static final long DEFAULT_SECONDS_OFFSET = 0L;
+
+    // QWP (WebSocket) transport
+    private static final String DEFAULT_PROTOCOL = "qwp";
+    private static final String DEFAULT_SENDER_ID = "ha_sender";
+    private static final String DEFAULT_STORE_FORWARD_DIR = "/tmp/qdb-sf";
+    private static final int DEFAULT_BATCH_SIZE = 10_000;
+    private static final int DEFAULT_BATCHES_PER_TRANSACTION = 10;
+
+    // Rows sent (client-side) across all workers, for the once-per-second progress reporter.
+    private static final AtomicLong TOTAL_SENT = new AtomicLong();
 
     // Column classification
     private static final String TIMESTAMP_COLUMN = "time";
@@ -73,6 +84,25 @@ public class TelemetryParallelSender {
                 String.valueOf(DEFAULT_TIMESTAMP_FROM_FILE)));
         final long secondsOffset = Long.parseLong(a.getOrDefault("--seconds-offset",
                 String.valueOf(DEFAULT_SECONDS_OFFSET)));
+        final String protocol = a.getOrDefault("--protocol", DEFAULT_PROTOCOL);
+        final String senderIdBase = a.getOrDefault("--sender-id", DEFAULT_SENDER_ID);
+        final String storeForwardDir = a.getOrDefault("--store-forward-dir", DEFAULT_STORE_FORWARD_DIR);
+        final int batchSize = Integer.parseInt(a.getOrDefault("--batch-size", String.valueOf(DEFAULT_BATCH_SIZE)));
+        final int batchesPerTransaction = Integer.parseInt(a.getOrDefault("--batches-per-transaction",
+                String.valueOf(DEFAULT_BATCHES_PER_TRANSACTION)));
+
+        if (!protocol.equals("qwp") && !protocol.equals("ilp")) {
+            System.err.println("--protocol must be 'qwp' or 'ilp', got: " + protocol);
+            System.exit(2);
+        }
+        if (batchSize <= 0) {
+            System.err.println("--batch-size must be > 0");
+            System.exit(2);
+        }
+        if (batchesPerTransaction <= 0) {
+            System.err.println("--batches-per-transaction must be > 0");
+            System.exit(2);
+        }
 
         if (!Files.exists(Path.of(csvPath))) {
             System.err.println("CSV file not found: " + csvPath);
@@ -87,10 +117,16 @@ public class TelemetryParallelSender {
             System.exit(2);
         }
 
+        final SenderCfg cfg = new SenderCfg(protocol, addrsCsv, token, username, password, retryTimeout,
+                senderIdBase, storeForwardDir, batchSize, batchesPerTransaction, numSenders);
+
         final String conf = buildConf(addrsCsv, token, username, password, retryTimeout);
-        final LineSenderBuilder builder = buildBuilder(addrsCsv, token, username, password, retryTimeout);
-        System.out.println("Ingestion started. Connecting with config: " +
-                conf.replaceAll("(token=)([^;]+)", "$1***")
+        System.out.println("Ingestion started. Protocol: " + protocol
+                + (protocol.equals("qwp")
+                        ? " (WebSocket, sender-id=" + senderIdBase + ", store-and-forward=" + storeForwardDir
+                                + ", batch-size=" + batchSize + ", batches-per-transaction=" + batchesPerTransaction + ")"
+                        : "")
+                + " | config: " + conf.replaceAll("(token=)([^;]+)", "$1***")
                         .replaceAll("(password=)([^;]+)", "$1***"));
 
         final CiscoCsvData data = loadCsv(csvPath);
@@ -122,12 +158,32 @@ public class TelemetryParallelSender {
         final ExecutorService exec = Executors.newFixedThreadPool(numSenders);
         final List<Future<?>> futures = new ArrayList<>(numSenders);
 
+        // Time only the ingestion: start right before the workers begin sending.
+        final long startNanos = System.nanoTime();
+
+        // Progress reporter: prints rows/s (client-side, sent) once per second.
+        final Thread reporter = new Thread(() -> {
+            long last = 0;
+            while (true) {
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException ie) {
+                    return;
+                }
+                long now = TOTAL_SENT.get();
+                System.out.printf("[progress] sent=%,d rate=%,d rows/s%n", now, now - last);
+                last = now;
+            }
+        });
+        reporter.setDaemon(true);
+        reporter.start();
+
         for (int id = 0; id < numSenders; id++) {
             final long eventsForThis = base + (id < rem ? 1 : 0);
             final int senderId = id;
             futures.add(exec.submit(
                     () -> runWorker(senderId, eventsForThis, delayMs, timestampFromFile, secondsOffset, timeIndex,
-                            header, rows, builder)));
+                            header, rows, cfg)));
         }
 
         // Wait for completion
@@ -140,7 +196,11 @@ public class TelemetryParallelSender {
                 System.exit(1);
             }
         }
-        System.out.println("All workers completed.");
+        reporter.interrupt();
+        final double elapsedSec = (System.nanoTime() - startNanos) / 1_000_000_000.0;
+        final double rowsPerSec = elapsedSec > 0 ? totalEvents / elapsedSec : 0;
+        System.out.printf("All workers completed. protocol=%s events=%d elapsed=%.3f s throughput=%,.0f rows/s%n",
+                protocol, totalEvents, elapsedSec, rowsPerSec);
         System.exit(0);
     }
 
@@ -153,12 +213,22 @@ public class TelemetryParallelSender {
             int timeIndex,
             String[] header,
             List<String[]> rows,
-            LineSenderBuilder builder) {
+            SenderCfg cfg) {
         System.out.printf("Sender %d will send %d events%n", senderId, totalEvents);
         long sent = 0;
         final int n = rows.size();
+        final boolean isQwp = cfg.protocol.equals("qwp");
+        // QWP with a single worker: stamp each row with the current time client-side. A single
+        // thread's timestamps are monotonic (no O3) and this avoids QWP's per-batch atNow()
+        // stamping. ILP, or QWP with more than one worker, use atNow() (server-side, O3-safe).
+        final boolean perRowMicros = isQwp && cfg.numSenders == 1;
+        // QWP transactional commit cadence: commit every batchSize * batchesPerTransaction
+        // rows via an explicit flush(). 0 disables periodic commits (ILP path is unchanged).
+        final long commitEveryRows = isQwp
+                ? (long) cfg.batchSize * cfg.batchesPerTransaction
+                : 0L;
 
-        try (Sender sender = builder.build()) {
+        try (Sender sender = buildSender(cfg, senderId)) {
             for (long i = 0; i < totalEvents; i++) {
                 String[] csvRow = rows.get((int) (i % n));
 
@@ -225,12 +295,21 @@ public class TelemetryParallelSender {
                     }
                 } else if (secondsOffset != 0) {
                     sender.at(Instant.now().plusSeconds(secondsOffset));
+                } else if (perRowMicros) {
+                    // QWP single worker: per-row microsecond timestamp (see runWorker header).
+                    sender.at(Instant.now());
                 } else {
                     // Default: server timestamp
                     sender.atNow();
                 }
 
                 sent++;
+                TOTAL_SENT.incrementAndGet();
+
+                // QWP-only: commit a transaction every batchSize * batchesPerTransaction rows.
+                if (commitEveryRows > 0 && sent % commitEveryRows == 0) {
+                    sender.flush();
+                }
 
                 if (delayMs > 0) {
                     try {
@@ -343,6 +422,63 @@ public class TelemetryParallelSender {
         return sb;
     }
 
+    // Builds a Sender for the configured transport. The ILP branch is the existing
+    // HTTP construction, verbatim, so --protocol ilp is identical to prior behaviour.
+    // The QWP branch adds store-and-forward and transactional commit; each worker gets
+    // a unique senderId and spill dir.
+    private static Sender buildSender(SenderCfg cfg, int workerId) {
+        if ("ilp".equals(cfg.protocol)) {
+            return buildBuilder(cfg.addrsCsv, cfg.token, cfg.username, cfg.password, cfg.retryTimeout).build();
+        }
+
+        // ---- QWP (WebSocket) branch ----
+        String[] addrs = Arrays.stream(cfg.addrsCsv.split(","))
+                .map(String::trim)
+                .filter(s -> !s.isEmpty())
+                .toArray(String[]::new);
+
+        boolean hasToken = cfg.token != null && !cfg.token.isEmpty();
+        boolean hasBasic = cfg.username != null && !cfg.username.isEmpty()
+                && cfg.password != null && !cfg.password.isEmpty();
+
+        LineSenderBuilder b = Sender.builder(Sender.Transport.WEBSOCKET);
+
+        // TLS is decided the same way as the ILP path: on when token/basic auth is present.
+        if ((hasToken || hasBasic)) {
+            b = b.enableTls().advancedTls().disableCertificateValidation();
+        }
+
+        for (String addr : addrs) {
+            b.address(addr);
+        }
+
+        if (hasToken) {
+            b.httpToken(cfg.token);
+        } else if (hasBasic) {
+            b.httpUsernamePassword(cfg.username, cfg.password);
+        }
+
+        final String who = cfg.senderIdBase + "-" + workerId;   // UNIQUE per worker/server
+        final String sfPath = cfg.storeForwardDir + "/" + who;
+        try {
+            Files.createDirectories(Path.of(sfPath));
+        } catch (Exception e) {
+            System.err.printf("[%s] WARN: could not pre-create store-and-forward dir %s: %s%n",
+                    who, sfPath, e.getMessage());
+        }
+
+        return b.storeAndForwardDir(sfPath)
+                .senderId(who)
+                .transactional(true)
+                .reconnectMaxDurationMillis(300_000)
+                .reconnectInitialBackoffMillis(100)
+                .reconnectMaxBackoffMillis(5_000)
+                .autoFlushBytes(524_288)              // 512 KiB, under the ~1MB WS frame cap
+                .autoFlushRows(cfg.batchSize)         // one batch = one deferred append
+                .autoFlushIntervalMillis(1_000)
+                .build();
+    }
+
     private static String buildConf(
             String addrsCsv,
             String token,
@@ -396,6 +532,11 @@ public class TelemetryParallelSender {
                 case "--timestamp-from-file":
                 case "--seconds-offset":
                 case "--retry-timeout":
+                case "--protocol":
+                case "--sender-id":
+                case "--store-forward-dir":
+                case "--batch-size":
+                case "--batches-per-transaction":
                     if (i + 1 >= args.length) {
                         throw new IllegalArgumentException("Missing value for " + k);
                     }
@@ -415,6 +556,38 @@ public class TelemetryParallelSender {
         CiscoCsvData(String[] header, List<String[]> rows) {
             this.header = header;
             this.rows = rows;
+        }
+    }
+
+    // Immutable transport config carried into each worker so buildSender() can construct
+    // a per-worker Sender (QWP needs a unique senderId + spill dir per worker).
+    private static final class SenderCfg {
+        final String protocol;
+        final String addrsCsv;
+        final String token;
+        final String username;
+        final String password;
+        final int retryTimeout;
+        final String senderIdBase;
+        final String storeForwardDir;
+        final int batchSize;
+        final int batchesPerTransaction;
+        final int numSenders;
+
+        SenderCfg(String protocol, String addrsCsv, String token, String username, String password,
+                  int retryTimeout, String senderIdBase, String storeForwardDir,
+                  int batchSize, int batchesPerTransaction, int numSenders) {
+            this.protocol = protocol;
+            this.addrsCsv = addrsCsv;
+            this.token = token;
+            this.username = username;
+            this.password = password;
+            this.retryTimeout = retryTimeout;
+            this.senderIdBase = senderIdBase;
+            this.storeForwardDir = storeForwardDir;
+            this.batchSize = batchSize;
+            this.batchesPerTransaction = batchesPerTransaction;
+            this.numSenders = numSenders;
         }
     }
 }
