@@ -557,7 +557,13 @@ public class CsvParallelSender {
                         if (latest[0] != Long.MIN_VALUE) {
                             // trades designated timestamp is microseconds by default.
                             Instant ts = Instant.EPOCH.plus(latest[0], ChronoUnit.MICROS);
-                            System.out.printf("[probe] latest trades timestamp = %s (raw=%d)%n", ts, latest[0]);
+                            final QwpServerInfo si = client.getServerInfo();
+                            final String served = si != null
+                                    ? " served by role=" + QwpServerInfo.roleName(si.getRole())
+                                            + " node=" + orNone(si.getNodeId()) + " zone=" + orNone(si.getZoneId())
+                                    : "";
+                            System.out.printf("[probe] latest trades timestamp = %s (raw=%d)%s%n",
+                                    ts, latest[0], served);
                         }
                     } catch (Exception e) {
                         if (!wasDown[0]) {
