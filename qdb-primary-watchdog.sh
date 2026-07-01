@@ -8,10 +8,10 @@
 # The new failover mechanism makes this trivial: no stopping processes, no marker files,
 # no env-var juggling, no restarting the instance, no sudo. Just health-ping + one POST.
 #
-# Assumptions:
-#   - This script runs ON the replica you want promoted (SWITCH_URL points at localhost).
-#   - QDB_REST_TOKEN is set (bearer token for the lifecycle endpoint).
-# If you run it elsewhere, point SWITCH_URL / LIFECYCLE_URL at the replica to promote.
+# Endpoints are explicit (see Config): PRIMARY_HEALTH_URL is the primary to watch;
+# SWITCH_URL / LIFECYCLE_URL are the replica to promote. Note the asymmetry: the switch is
+# POSTed to the lifecycle admin port (:9003), but the STATUS is read from the main HTTP
+# port (:9000). Requires QDB_REST_TOKEN. Run it anywhere with network access to both nodes.
 
 # Do NOT source this script
 if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
@@ -23,9 +23,9 @@ set -o pipefail
 LC_ALL=C
 
 # ===================== Config =====================
-PRIMARY_HEALTH_URL="http://172.31.42.41:9003/lifecycle"  # remote primary to watch (health ping)
-SWITCH_URL="http://localhost:9003/lifecycle/switch"      # LOCAL node's lifecycle switch endpoint
-LIFECYCLE_URL="http://localhost:9003/lifecycle"          # LOCAL node lifecycle status
+PRIMARY_HEALTH_URL="https://172.31.42.41:9003/lifecycle" # primary to watch; ANY HTTP reply = alive, no reply = down
+SWITCH_URL="https://172.31.41.35:9003/lifecycle/switch"  # replica's lifecycle SWITCH endpoint (POST, :9003)
+LIFECYCLE_URL="https://172.31.41.35:9003/lifecycle"      # replica's lifecycle STATUS endpoint (GET, :9003)
 TARGET_ROLE="primary"                                    # role to switch the local node to
 SWITCH_TIMEOUT_MS=5000                                   # timeout_ms in the switch payload
 FAIL_THRESHOLD=5                                         # consecutive health failures before failover
@@ -104,12 +104,14 @@ main() {
   while true; do
     local code
     code="$(get_http_code)"
-    if [[ "$code" == "200" ]]; then
-      (( fail_count > 0 )) && log "OK 200, resetting fail counter (was $fail_count)"
-      fail_count=0
-    else
+    # Any HTTP reply means the primary is alive. Only a connection failure or timeout (000)
+    # counts as down, so we do not false-failover on a non-200 that still proves reachability.
+    if [[ "$code" == "000" ]]; then
       (( fail_count++ ))
-      log "Health check failed, HTTP $code (consecutive fails: $fail_count/$FAIL_THRESHOLD)"
+      log "Primary unreachable, no HTTP response (consecutive fails: $fail_count/$FAIL_THRESHOLD)"
+    else
+      (( fail_count > 0 )) && log "Primary responding again (HTTP $code), resetting fail counter (was $fail_count)"
+      fail_count=0
     fi
 
     if (( fail_count >= FAIL_THRESHOLD )); then
