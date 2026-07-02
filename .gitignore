@@ -34,3 +34,6 @@ Thumbs.db
 # === Test Reports ===
 surefire-reports/
 failsafe-reports/
+
+# === Watchdog config (holds the REST token; commit only the .example) ===
+qdb-primary-watchdog.env
