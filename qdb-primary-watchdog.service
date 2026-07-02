@@ -1,0 +1,33 @@
+# systemd unit for the QuestDB primary failover watchdog.
+#
+# Install:
+#   sudo cp qdb-primary-watchdog.sh  /usr/local/bin/qdb-primary-watchdog.sh
+#   sudo chmod +x                    /usr/local/bin/qdb-primary-watchdog.sh
+#   sudo cp qdb-primary-watchdog.env.example /etc/qdb-primary-watchdog.env
+#   sudo chmod 600 /etc/qdb-primary-watchdog.env    # holds the token
+#   sudoedit /etc/qdb-primary-watchdog.env          # set QDB_REST_TOKEN + QDB_WD_SERVERS
+#   sudo cp qdb-primary-watchdog.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now qdb-primary-watchdog
+#   journalctl -u qdb-primary-watchdog -f
+#
+# The script auto-loads /etc/qdb-primary-watchdog.env on its own, so EnvironmentFile below is
+# optional (kept for clarity; systemd-provided vars still win over the file either way).
+#
+# IMPORTANT: run exactly ONE watchdog per cluster. Two would try to promote different nodes
+# and fight (split-brain). Put it on a separate monitoring host or one designated node.
+
+[Unit]
+Description=QuestDB primary failover watchdog
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/qdb-primary-watchdog.env
+ExecStart=/usr/local/bin/qdb-primary-watchdog.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

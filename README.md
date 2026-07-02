@@ -239,5 +239,66 @@ What moved the needle, and what did not:
 Build the client to match the server (see [Compile](#compile)); these numbers used the
 QWP WebSocket transport.
 
+## Primary failover watchdog
+
+`qdb-primary-watchdog.sh` is a standalone Bash watchdog for an Enterprise cluster. Give it the
+ordered list of every node's lifecycle admin endpoint (`host:9003`); it finds the current
+primary, health-checks it, and on failure promotes another node via the lifecycle REST API.
+
+Behaviour:
+
+- **Detect:** on startup it sweeps the list and monitors whichever node reports
+  `currentRole:PRIMARY`.
+- **Step down first:** when the primary stops responding it first sends a best-effort
+  `{"role":"replica"}` to the old primary, so a false positive (it is actually still up) cannot
+  leave two primaries.
+- **Promote in order:** it then promotes the first reachable node in list order (earliest first,
+  skipping the dead one), retrying with exponential backoff. With `a,b,c`, if `b` is primary and
+  dies it fails back to `a` when `a` is available, and only reaches `c` if `a` cannot be promoted.
+  It then monitors the newly promoted node, repeating indefinitely.
+- **Give up:** exits only if no node can be promoted (whole cluster down), or if no primary is
+  found at startup. Under systemd it is then restarted and re-detects the primary.
+
+All endpoints are `https` (Enterprise only).
+
+### Configuration
+
+Required, no defaults: the node list and `QDB_REST_TOKEN`. Everything else has a default and is
+overridable via a `QDB_WD_*` variable. Precedence: **CLI arg (servers) > environment > config
+file > defaults**; a value already in the environment is never overridden by the file.
+
+```bash
+# node list as the first argument:
+QDB_REST_TOKEN=... ./qdb-primary-watchdog.sh 172.31.42.41:9003,172.31.41.35:9003,10.0.0.8:9003
+# or entirely from the environment / a config file:
+export QDB_REST_TOKEN=...  QDB_WD_SERVERS=...  QDB_WD_FAIL_THRESHOLD=2
+./qdb-primary-watchdog.sh
+```
+
+The script auto-loads a config file if present (first of `/etc/qdb-primary-watchdog.env`,
+`~/.config/qdb-primary-watchdog.env`, or one beside the script; or `$QDB_WD_CONFIG`). See
+[`qdb-primary-watchdog.env.example`](./qdb-primary-watchdog.env.example) for every setting.
+
+### Run it as a service
+
+The same script and config file work by hand or under systemd. Install with
+[`qdb-primary-watchdog.service`](./qdb-primary-watchdog.service):
+
+```bash
+sudo cp qdb-primary-watchdog.sh  /usr/local/bin/qdb-primary-watchdog.sh
+sudo chmod +x                    /usr/local/bin/qdb-primary-watchdog.sh
+sudo cp qdb-primary-watchdog.env.example /etc/qdb-primary-watchdog.env
+sudo chmod 600 /etc/qdb-primary-watchdog.env      # holds the token
+sudoedit /etc/qdb-primary-watchdog.env            # set QDB_REST_TOKEN and QDB_WD_SERVERS
+sudo cp qdb-primary-watchdog.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now qdb-primary-watchdog
+journalctl -u qdb-primary-watchdog -f
+```
+
+`Restart=always` brings it back on crash or after an all-nodes-down exit.
+
+**Run exactly one watchdog per cluster.** Two instances would try to promote different nodes and
+fight (split-brain). Put it on a separate monitoring host or one designated node.
 
 For a similar sender, but for telemetry data, see the instructions (and license info) at [the Telemetry Readme](./TelemetryReadme.md)

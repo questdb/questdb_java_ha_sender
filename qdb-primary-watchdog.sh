@@ -28,6 +28,39 @@ fi
 set -o pipefail
 LC_ALL=C
 
+log() { printf '[%(%Y-%m-%d %H:%M:%S)T] %s\n' -1 "$*"; }
+
+# Load KEY=VALUE lines from a config file into the environment, but never override a variable
+# already set (so an inline `VAR=x ./script`, or systemd's EnvironmentFile, wins over the file).
+# This lets the same script + config file work whether run by hand or under systemd.
+load_env_file() {
+  local file="$1" line key val
+  [[ -r "$file" ]] || return 0
+  log "Loading config from $file"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"; line="${line#"${line%%[![:space:]]*}"}"   # strip CR + left-trim
+    [[ -z "$line" || "$line" == '#'* ]] && continue
+    [[ "$line" == export\ * ]] && line="${line#export }"
+    [[ "$line" != *=* ]] && continue
+    key="${line%%=*}"; key="${key%%[[:space:]]*}"
+    val="${line#*=}"
+    val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"   # trim
+    if [[ "$val" == \"*\" || "$val" == \'*\' ]]; then val="${val:1:${#val}-2}"; fi
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && -z "${!key+x}" ]] && export "$key=$val"
+  done < "$file"
+}
+
+# Config file discovery: explicit $QDB_WD_CONFIG wins, else the first existing standard path.
+CONFIG_FILE="${QDB_WD_CONFIG:-}"
+if [[ -z "$CONFIG_FILE" ]]; then
+  for c in /etc/qdb-primary-watchdog.env \
+           "${XDG_CONFIG_HOME:-$HOME/.config}/qdb-primary-watchdog.env" \
+           "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/qdb-primary-watchdog.env"; do
+    [[ -r "$c" ]] && { CONFIG_FILE="$c"; break; }
+  done
+fi
+[[ -n "$CONFIG_FILE" ]] && load_env_file "$CONFIG_FILE"
+
 # ===================== Config =====================
 # REQUIRED, no default: ordered lifecycle admin endpoints (host:port, the :9003 port) of every
 # node in the cluster. Taken from the first CLI arg, else $QDB_WD_SERVERS.
@@ -61,8 +94,6 @@ if (( ${#SERVERS[@]} == 0 )); then
   echo "ERROR: node list is empty." >&2
   exit 2
 fi
-
-log() { printf '[%(%Y-%m-%d %H:%M:%S)T] %s\n' -1 "$*"; }
 
 # GET a node's /lifecycle. Prints the raw JSON, or nothing if unreachable.
 lifecycle_json() {
