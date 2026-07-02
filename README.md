@@ -186,6 +186,36 @@ timestamps, so O3 is still avoided, and this sidesteps the per-batch stamping ab
 (giving near-distinct per-row timestamps). ILP, or QWP with more than one worker, keep
 using server-side `atNow()`, which stays O3-safe across concurrent senders.
 
+## Row id and dedup (`trade_id`)
+
+Every row the trades sender writes carries a `trade_id` column of the form
+`<worker>-<sequence>` (for example `0-1`, `0-2`, ...), where the sequence is 1-based and
+monotonic per sender. It is a high-cardinality **VARCHAR**, deliberately not a symbol (each
+row is unique, so a symbol column would blow up the symbol table).
+
+Two uses:
+
+- **Completeness check, timestamp-independent.** Each sender emits a contiguous `1..N`, so you
+  can confirm nothing was lost and spot gaps regardless of how rows were timestamped.
+- **Idempotent replay via dedup.** Store-and-forward is at-least-once: on a failover the client
+  replays the un-acked in-flight transaction to the new primary, re-writing the rows the old
+  primary had already durably persisted (send 100,000 rows, kill the primary mid-transaction,
+  and you land ~100,101). Enabling dedup collapses those back to exactly once:
+
+  ```sql
+  ALTER TABLE trades DEDUP ENABLE UPSERT KEYS(timestamp, trade_id);
+  ```
+
+  Dedup keys must include the designated timestamp, so the match is on `(timestamp, trade_id)`.
+  `trade_id` also keeps legitimately-distinct rows that share a microsecond apart (common at
+  millions of rows/s), which a `(symbol, side, timestamp)` key alone would wrongly merge.
+
+**Requirement:** dedup only catches replays when the row carries a **client-side timestamp**, so
+the timestamp is baked into the spilled frame and reproduced identically on replay. That means a
+single worker (the default `at(Instant.now())` path) or `--timestamp-from-file` /
+`--seconds-offset`. Under multi-worker `atNow()` the new primary assigns a fresh timestamp on
+replay and dedup cannot match. See [Timestamps and throughput](#timestamps-and-throughput).
+
 ## Benchmarking throughput
 
 On completion the sender prints the ingestion time and rate, for example:
