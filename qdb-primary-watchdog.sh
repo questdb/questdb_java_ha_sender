@@ -5,16 +5,19 @@
 #
 # Give it the ordered list of lifecycle admin endpoints (host:9003) of ALL nodes. On start it
 # finds which one currently reports role PRIMARY and health-monitors it. When that primary
-# stops responding, it promotes the next node in the list (round-robin) via
-# POST /lifecycle/switch, waits for the switch to settle, then monitors the new primary. If a
-# full pass around the ring finds no node it can promote (the whole cluster is down), it exits.
+# stops responding, it promotes the first reachable node in list order (earliest first,
+# skipping the failed one) via POST /lifecycle/switch, waits for the switch to settle, then
+# monitors the newly promoted node. If no node can be promoted (the whole cluster is down),
+# it exits.
 #
-# All endpoints are https (Enterprise only). Requires QDB_REST_TOKEN (bearer token).
+# Required, no defaults: the node list and QDB_REST_TOKEN. The node list comes from the first
+# CLI arg or $QDB_WD_SERVERS; the token from $QDB_REST_TOKEN. Everything else has a default
+# and can be overridden via its QDB_WD_* variable. All endpoints are https (Enterprise only).
 #
 # Usage:
 #   export QDB_REST_TOKEN="..."
-#   ./qdb-primary-watchdog.sh                                  # uses DEFAULT_SERVERS below
-#   ./qdb-primary-watchdog.sh h1:9003,h2:9003,h3:9003          # or pass the list explicitly
+#   ./qdb-primary-watchdog.sh h1:9003,h2:9003,h3:9003                 # node list as arg, or:
+#   QDB_WD_SERVERS=h1:9003,h2:9003,h3:9003 ./qdb-primary-watchdog.sh
 
 # Do NOT source this script
 if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
@@ -26,28 +29,36 @@ set -o pipefail
 LC_ALL=C
 
 # ===================== Config =====================
-# Ordered lifecycle admin endpoints (host:port, the :9003 port) of every node in the cluster.
-DEFAULT_SERVERS="172.31.42.41:9003,172.31.41.35:9003,10.0.0.8:9003"
-SERVERS_CSV="${1:-$DEFAULT_SERVERS}"          # first CLI arg overrides the default list
+# REQUIRED, no default: ordered lifecycle admin endpoints (host:port, the :9003 port) of every
+# node in the cluster. Taken from the first CLI arg, else $QDB_WD_SERVERS.
+SERVERS_CSV="${1:-${QDB_WD_SERVERS:-}}"
 
-TARGET_ROLE="primary"        # role to switch a node to on failover
-SWITCH_TIMEOUT_MS=5000       # timeout_ms in the switch payload
-FAIL_THRESHOLD=3             # consecutive health failures before failover
-CHECK_INTERVAL=1             # seconds between health checks
-STARTUP_RETRIES=3            # sweeps to find the initial primary before giving up
-SWITCH_RETRIES=3             # retries if a switch POST is not accepted
-SWITCH_POLL_INTERVAL=1       # seconds between lifecycle polls after a switch
-SWITCH_POLL_MAX=30           # max polls to wait for a switch to settle
+# Everything below has a default; override via the matching QDB_WD_* environment variable.
+TARGET_ROLE="${QDB_WD_TARGET_ROLE:-primary}"              # role to switch a node to on failover
+SWITCH_TIMEOUT_MS="${QDB_WD_SWITCH_TIMEOUT_MS:-5000}"     # timeout_ms in the switch payload
+FAIL_THRESHOLD="${QDB_WD_FAIL_THRESHOLD:-3}"              # consecutive health failures before failover
+CHECK_INTERVAL="${QDB_WD_CHECK_INTERVAL:-1}"             # seconds between health checks
+STARTUP_RETRIES="${QDB_WD_STARTUP_RETRIES:-3}"          # sweeps to find the initial primary before giving up
+SWITCH_RETRIES="${QDB_WD_SWITCH_RETRIES:-3}"            # retries if a switch POST is not accepted
+SWITCH_POLL_INTERVAL="${QDB_WD_SWITCH_POLL_INTERVAL:-1}" # seconds between lifecycle polls after a switch
+SWITCH_POLL_MAX="${QDB_WD_SWITCH_POLL_MAX:-30}"         # max polls to wait for a switch to settle
+# QDB_REST_TOKEN is also REQUIRED (no default); checked below.
 # ==================================================
 
 if [[ -z "${QDB_REST_TOKEN:-}" ]]; then
-  echo "ERROR: QDB_REST_TOKEN is not set. Aborting."
+  echo "ERROR: QDB_REST_TOKEN is required (no default). Set it in the environment." >&2
+  exit 2
+fi
+
+if [[ -z "$SERVERS_CSV" ]]; then
+  echo "ERROR: no node list (no default). Pass it as the first argument or set QDB_WD_SERVERS." >&2
+  echo "  e.g. $0 h1:9003,h2:9003,h3:9003" >&2
   exit 2
 fi
 
 IFS=',' read -r -a SERVERS <<< "$SERVERS_CSV"
 if (( ${#SERVERS[@]} == 0 )); then
-  echo "ERROR: no servers configured."
+  echo "ERROR: node list is empty." >&2
   exit 2
 fi
 
@@ -139,17 +150,19 @@ find_primary() {
   return 1
 }
 
-# Promote the next reachable node after index $1, round-robin. Sets FOUND_IDX, returns 0/1.
+# Promote the first reachable node in list order (earliest wins), skipping the current
+# (failed) primary. So with a,b,c where b is primary and dies, it tries a first, then c;
+# it only reaches c if a cannot be promoted. Sets FOUND_IDX, returns 0/1.
 failover_from() {
-  local cur="$1" n="${#SERVERS[@]}" step idx
-  for (( step=1; step<n; step++ )); do
-    idx=$(( (cur + step) % n ))
-    log "Attempting failover to ${SERVERS[$idx]} (index $idx)"
-    if promote "${SERVERS[$idx]}"; then
-      FOUND_IDX=$idx
+  local cur="$1" n="${#SERVERS[@]}" i
+  for (( i=0; i<n; i++ )); do
+    (( i == cur )) && continue          # never fail back to the node that just died
+    log "Attempting failover to ${SERVERS[$i]} (index $i)"
+    if promote "${SERVERS[$i]}"; then
+      FOUND_IDX=$i
       return 0
     fi
-    log "  ${SERVERS[$idx]} could not be promoted, trying next"
+    log "  ${SERVERS[$i]} could not be promoted, trying next"
   done
   return 1
 }
