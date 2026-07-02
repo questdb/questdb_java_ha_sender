@@ -114,9 +114,29 @@ wait_switch_complete() {
   return 1
 }
 
-# Promote one node to primary. Returns 0 only if it accepts the switch and settles as primary.
+# Best-effort: tell the (presumed-down) old primary to step down to replica before we promote a
+# new one. Guards against a false positive where the primary is actually still up, so we never
+# end up with two primaries. Expected to usually fail (the primary really is down); the result
+# is ignored. Intentionally NO timeout on this curl: if the old primary is reachable, let the
+# step-down complete however long it needs.
+demote_to_replica() {
+  local hostport="$1" code body
+  log "Asking old primary $hostport to step down to replica first (best effort)"
+  body="$(curl -ksS -w $'\n%{http_code}' \
+      -X POST "https://$hostport/lifecycle/switch" \
+      -H "Authorization: Bearer $QDB_REST_TOKEN" \
+      -H "Content-Type: application/json" \
+      --data '{"role":"replica"}' 2>&1)"
+  code="${body##*$'\n'}"
+  body="${body%$'\n'*}"
+  log "  step-down $hostport HTTP $code: $body"
+}
+
+# Promote one node to primary. On a failed attempt it retries with exponential backoff, using
+# SWITCH_TIMEOUT_MS as the base delay: ~5s before the 2nd attempt, ~10s before the 3rd, doubling.
+# Returns 0 only if a switch is accepted and the node settles as primary.
 promote() {
-  local hostport="$1" attempt code body
+  local hostport="$1" attempt code body delay_ms="$SWITCH_TIMEOUT_MS"
   for (( attempt=1; attempt<=SWITCH_RETRIES; attempt++ )); do
     log "  requesting switch on $hostport (attempt $attempt/$SWITCH_RETRIES)"
     body="$(curl -ksS -w $'\n%{http_code}' \
@@ -127,12 +147,16 @@ promote() {
     code="${body##*$'\n'}"   # last line = HTTP code
     body="${body%$'\n'*}"    # everything before it = response body
     log "  switch $hostport HTTP $code: $body"
-    if [[ "$code" == 2* ]]; then
-      wait_switch_complete "$hostport" && return 0
-      return 1
+    if [[ "$code" == 2* ]] && wait_switch_complete "$hostport"; then
+      return 0
     fi
-    sleep 1
+    if (( attempt < SWITCH_RETRIES )); then
+      log "  promote attempt $attempt did not take, retrying in $((delay_ms / 1000))s"
+      sleep "$(( delay_ms / 1000 ))"
+      delay_ms=$(( delay_ms * 2 ))
+    fi
   done
+  log "  could not promote $hostport after $SWITCH_RETRIES attempts"
   return 1
 }
 
@@ -197,6 +221,7 @@ main() {
 
     if (( fail_count >= FAIL_THRESHOLD )); then
       log "Primary ${SERVERS[$cur]} is down, initiating failover"
+      demote_to_replica "${SERVERS[$cur]}"   # first, try to make the old primary stand down
       if failover_from "$cur"; then
         cur=$FOUND_IDX
         fail_count=0
