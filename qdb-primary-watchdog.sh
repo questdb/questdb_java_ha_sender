@@ -69,6 +69,7 @@ SERVERS_CSV="${1:-${QDB_WD_SERVERS:-}}"
 # Everything below has a default; override via the matching QDB_WD_* environment variable.
 TARGET_ROLE="${QDB_WD_TARGET_ROLE:-primary}"              # role to switch a node to on failover
 SWITCH_TIMEOUT_MS="${QDB_WD_SWITCH_TIMEOUT_MS:-5000}"     # timeout_ms in the switch payload
+STEPDOWN_CONNECT_TIMEOUT="${QDB_WD_STEPDOWN_CONNECT_TIMEOUT:-3}" # connect timeout (s) for the old-primary step-down
 FAIL_THRESHOLD="${QDB_WD_FAIL_THRESHOLD:-3}"              # consecutive health failures before failover
 CHECK_INTERVAL="${QDB_WD_CHECK_INTERVAL:-1}"             # seconds between health checks
 STARTUP_RETRIES="${QDB_WD_STARTUP_RETRIES:-3}"          # sweeps to find the initial primary before giving up
@@ -148,12 +149,13 @@ wait_switch_complete() {
 # Best-effort: tell the (presumed-down) old primary to step down to replica before we promote a
 # new one. Guards against a false positive where the primary is actually still up, so we never
 # end up with two primaries. Expected to usually fail (the primary really is down); the result
-# is ignored. Intentionally NO timeout on this curl: if the old primary is reachable, let the
-# step-down complete however long it needs.
+# is ignored. Only the CONNECT phase is bounded (STEPDOWN_CONNECT_TIMEOUT, default 3s) so an
+# unreachable host fails fast instead of hanging ~2 min; there is no overall timeout, so once
+# connected the step-down runs however long it needs.
 demote_to_replica() {
   local hostport="$1" code body
   log "Asking old primary $hostport to step down to replica first (best effort)"
-  body="$(curl -ksS -w $'\n%{http_code}' \
+  body="$(curl -ksS -w $'\n%{http_code}' --connect-timeout "$STEPDOWN_CONNECT_TIMEOUT" \
       -X POST "https://$hostport/lifecycle/switch" \
       -H "Authorization: Bearer $QDB_REST_TOKEN" \
       -H "Content-Type: application/json" \
