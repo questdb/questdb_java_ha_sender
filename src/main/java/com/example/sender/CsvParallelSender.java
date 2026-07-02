@@ -221,12 +221,15 @@ public class CsvParallelSender {
             for (long i = 0; i < totalEvents; i++) {
                 TradeRow r = rows.get((int) (i % n));
 
-                // Build row
+                // Build row. trade_id = <worker>-<1-based sequence>, monotonic per sender, so you
+                // can check completeness/gaps independent of timestamps and (with dedup) get
+                // idempotent replay. It is a high-cardinality VARCHAR, deliberately NOT a symbol.
                 sender.table("trades")
                         .symbol("symbol", r.symbol)
                         .symbol("side", r.side)
                         .doubleColumn("price", r.price)
-                        .doubleColumn("amount", r.amount);
+                        .doubleColumn("amount", r.amount)
+                        .stringColumn("trade_id", senderId + "-" + (i + 1));
 
                 if (timestampFromFile) {
                     Instant ts = Instant.parse(r.timestamp);
