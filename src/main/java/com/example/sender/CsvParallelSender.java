@@ -52,6 +52,11 @@ public class CsvParallelSender {
     // Probe (QWP only): poll the latest ingested timestamp on an interval, 0 disables.
     private static final long DEFAULT_PROBE_INTERVAL_MS = 1000L;
     private static final String PROBE_QUERY = "select timestamp from trades limit -1";
+    // Enterprise lifecycle status of whichever node the query client is currently connected to.
+    // Returns the LIVE role (columns like current_role / target_role), unlike the QWP handshake
+    // SERVER_INFO which is only refreshed on a reconnect and so goes stale after an in-place
+    // primary<->replica switch. The probe runs this each poll to report the true serving role.
+    private static final String STATUS_QUERY = "switch status";
     // Zone for the query client (egress). Biases failover toward same-zone instances on
     // Enterprise; a no-op on OSS (which advertises no zone). Empty omits the key.
     private static final String DEFAULT_ZONE = "eu-west-1";
@@ -181,7 +186,7 @@ public class CsvParallelSender {
             try {
                 f.get();
             } catch (ExecutionException ee) {
-                System.err.println("Worker failed: " + ee.getCause());
+                System.err.println("Worker failed: " + ee.getCause() + authHint(ee.getCause()));
                 System.exit(1);
             }
         }
@@ -266,7 +271,7 @@ public class CsvParallelSender {
             sender.flush();
             System.out.printf("Sender %d finished sending %d events%n", senderId, sent);
         } catch (Exception e) {
-            System.err.printf("Sender %d got error: %s%n", senderId, e.toString());
+            System.err.printf("Sender %d got error: %s%s%n", senderId, e.toString(), authHint(e));
             throw new RuntimeException(e);
         }
     }
@@ -433,7 +438,7 @@ public class CsvParallelSender {
                     noisy = true;
                     break;
                 case ENDPOINT_ATTEMPT_FAILED:
-                    msg = "endpoint " + host + " failed (" + cause + "), trying next";
+                    msg = "endpoint " + host + " failed (" + cause + "), trying next" + authHint(cause);
                     noisy = true;
                     break;
                 case ALL_ENDPOINTS_UNREACHABLE:
@@ -549,8 +554,48 @@ public class CsvParallelSender {
                                 orNone(info.getNodeId()), QwpServerInfo.roleName(info.getRole()), orNone(info.getZoneId()));
                     }
                 };
+                // Captures the live lifecycle role from `switch status`: joins every column whose
+                // name mentions "role" (current_role, target_role, ...) into e.g. "current_role=PRIMARY".
+                final String[] liveRole = {null};
+                final QwpColumnBatchHandler statusHandler = new QwpColumnBatchHandler() {
+                    @Override
+                    public void onBatch(QwpColumnBatch batch) {
+                        final int cols = batch.getColumnCount();
+                        batch.forEachRow(row -> {
+                            final StringBuilder sb = new StringBuilder();
+                            for (int c = 0; c < cols; c++) {
+                                final String name = batch.getColumnName(c);
+                                if (name != null && name.toLowerCase(java.util.Locale.ROOT).contains("role")) {
+                                    if (sb.length() > 0) {
+                                        sb.append(' ');
+                                    }
+                                    sb.append(name).append('=')
+                                            .append(row.isNull(c) ? "(none)" : row.getString(c));
+                                }
+                            }
+                            if (sb.length() > 0) {
+                                liveRole[0] = sb.toString();
+                            }
+                        });
+                    }
+
+                    @Override
+                    public void onEnd(long totalRows) {
+                    }
+
+                    @Override
+                    public void onError(byte status, String message) {
+                        // e.g. OSS server without lifecycle, or insufficient permissions: leave
+                        // liveRole null so the probe falls back to the handshake node id.
+                    }
+
+                    @Override
+                    public void onFailoverReset(QwpServerInfo info) {
+                    }
+                };
                 while (!Thread.currentThread().isInterrupted()) {
                     latest[0] = Long.MIN_VALUE;
+                    liveRole[0] = null;
                     try {
                         client.execute(PROBE_QUERY, handler);
                         if (wasDown[0]) {
@@ -560,11 +605,20 @@ public class CsvParallelSender {
                         if (latest[0] != Long.MIN_VALUE) {
                             // trades designated timestamp is microseconds by default.
                             Instant ts = Instant.EPOCH.plus(latest[0], ChronoUnit.MICROS);
-                            final QwpServerInfo si = client.getServerInfo();
-                            final String served = si != null
-                                    ? " served by role=" + QwpServerInfo.roleName(si.getRole())
-                                            + " node=" + orNone(si.getNodeId()) + " zone=" + orNone(si.getZoneId())
-                                    : "";
+                            // Ask the serving node for its live role. A status-query failure must not
+                            // look like a connection loss, so swallow it here (liveRole stays null).
+                            try {
+                                client.execute(STATUS_QUERY, statusHandler);
+                            } catch (Exception ignore) {
+                                // fall through to the handshake fallback below
+                            }
+                            final String served;
+                            if (liveRole[0] != null) {
+                                served = " served by " + liveRole[0] + " (live)";
+                            } else {
+                                final QwpServerInfo si = client.getServerInfo();
+                                served = si != null ? " served by node=" + orNone(si.getNodeId()) : "";
+                            }
                             System.out.printf("[probe] latest trades timestamp = %s (raw=%d)%s%n",
                                     ts, latest[0], served);
                         }
@@ -580,7 +634,7 @@ public class CsvParallelSender {
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
             } catch (Exception e) {
-                System.err.println("[probe] stopped: " + e.getMessage());
+                System.err.println("[probe] stopped: " + e.getMessage() + authHint(e));
             }
         }, "qwp-probe");
         t.setDaemon(true);
@@ -590,6 +644,29 @@ public class CsvParallelSender {
 
     private static String orNone(String s) {
         return (s == null || s.isEmpty()) ? "(none)" : s;
+    }
+
+    // A QWP server rejects a missing/invalid ILP auth token by refusing the WebSocket
+    // upgrade with a bare "HTTP/1.1 400 Bad request" (it never gets far enough to return
+    // a 401), which is impossible to diagnose from the raw message. Detect that signature
+    // and append an explicit hint. Returns "" when the text is not an upgrade-400.
+    private static String authHint(String m) {
+        if (m != null && m.contains("WebSocket upgrade failed") && m.contains("400")) {
+            return " -- likely a missing or invalid ILP auth token (the server refuses the"
+                    + " WebSocket upgrade before it can return 401); check --token or --user/--password";
+        }
+        return "";
+    }
+
+    // Same, but walks a throwable's cause chain (the upgrade failure is usually wrapped).
+    private static String authHint(Throwable t) {
+        for (Throwable c = t; c != null; c = c.getCause()) {
+            final String h = authHint(c.getMessage());
+            if (!h.isEmpty()) {
+                return h;
+            }
+        }
+        return "";
     }
 
     private static String buildConf(String addrsCsv, String token, String username, String password, int retryTimeout) {

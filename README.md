@@ -105,8 +105,16 @@ runs `select timestamp from trades limit -1` over a **QWP query client** and is 
 independent of the senders, so it does not affect ingestion.
 
 ```
-[probe] latest trades timestamp = 2026-07-01T14:31:40.591545Z (raw=1782916300591545)
+[probe] latest trades timestamp = 2026-07-01T14:31:40.591545Z (raw=1782916300591545) served by current_role=PRIMARY target_role=PRIMARY (live)
 ```
+
+The `served by ... (live)` suffix is the **live** lifecycle role of the node currently
+answering the probe, obtained by running `switch status` on it each poll. This matters on
+failover: the QWP handshake `SERVER_INFO` (node/role) is only refreshed on a *reconnect*, so
+after an in-place primary&rarr;replica switch (which does not drop the read connection) it goes
+stale. `switch status` always reflects the truth, so the role you see flips the moment the
+serving node changes role. On a server without the lifecycle API (OSS), the status query is
+unavailable and the probe falls back to `served by node=<nodeId>` from the handshake.
 
 The query client uses the **same host list and token/auth** as the senders and enables
 **failover** when more than one host is given (`ws|wss::addr=h1,h2,...;...;failover=on`), so
@@ -146,6 +154,16 @@ The **ingestion client** (one per worker) reports connection-state changes via t
 ```
 
 (also `auth failed` and `reconnect budget exhausted` terminal states.)
+
+A missing or invalid ILP token is easy to misread: the QWP server refuses the WebSocket
+upgrade with a bare `HTTP/1.1 400 Bad request` (it never gets far enough to return a 401),
+so the raw client error mentions neither auth nor the token. Wherever that signature appears
+(the `endpoint ... failed` line and the fatal `Sender N got error` / `Worker failed` lines)
+the sender appends an explicit hint:
+
+```
+Sender 0 got error: io.questdb.client...WebSocketUpgradeException: WebSocket upgrade failed: HTTP/1.1 400 Bad request -- likely a missing or invalid ILP auth token (the server refuses the WebSocket upgrade before it can return 401); check --token or --user/--password
+```
 
 The **query client** (the probe) reports, prefixed `[query client]`:
 
@@ -272,22 +290,35 @@ QWP WebSocket transport.
 ## Primary failover watchdog
 
 `qdb-primary-watchdog.sh` is a standalone Bash watchdog for an Enterprise cluster. Give it the
-ordered list of every node's lifecycle admin endpoint (`host:9003`); it finds the current
-primary, health-checks it, and on failure promotes another node via the lifecycle REST API.
+ordered list of every node's lifecycle admin endpoint (`host:9003`); it finds (or, on a
+fresh cluster, elects) the current primary, monitors its role, and on failure promotes another
+node via the lifecycle REST API.
 
 Behaviour:
 
-- **Detect:** on startup it sweeps the list and monitors whichever node reports
-  `currentRole:PRIMARY`.
-- **Step down first:** when the primary stops responding it first sends a best-effort
-  `{"role":"replica"}` to the old primary, so a false positive (it is actually still up) cannot
-  leave two primaries.
-- **Promote in order:** it then promotes the first reachable node in list order (earliest first,
-  skipping the dead one), retrying with exponential backoff. With `a,b,c`, if `b` is primary and
-  dies it fails back to `a` when `a` is available, and only reaches `c` if `a` cannot be promoted.
-  It then monitors the newly promoted node, repeating indefinitely.
-- **Give up:** exits only if no node can be promoted (whole cluster down), or if no primary is
-  found at startup. Under systemd it is then restarted and re-detects the primary.
+- **Detect / bootstrap:** on startup it sweeps the list and monitors whichever node reports
+  `currentRole:PRIMARY`. If **no** node is primary yet (a freshly-started cluster) it promotes
+  the first healthy node in list order, so the cluster always ends up with a primary. If every
+  node is unhealthy it keeps retrying rather than exiting. Split-brain is not a concern here:
+  QuestDB stops the offending node if two ever claim primary.
+- **Monitor the role, not just health:** each interval it reads the primary's `currentRole`.
+  A node that stops responding **or** is silently demoted to `REPLICA` out-of-band both count
+  as a failure, so it reacts to a demotion even while the node is still reachable.
+- **Grace period:** after detecting loss it waits `QDB_WD_GRACE_PERIOD` seconds (default `5`,
+  `0` disables) before acting, then re-checks. This lets an operator do a manual switch (demote
+  the primary, promote a replica) without the watchdog racing them, as long as it completes
+  within the window.
+- **Adopt if already switched:** it then re-checks the cluster; if another node is already
+  `PRIMARY` (an operator switch, or the old primary recovered) it simply adopts it, no new switch.
+- **Step down first:** otherwise it sends a best-effort `{"role":"replica"}` to the old primary,
+  so a false positive (it is actually still up) cannot leave two primaries.
+- **Promote the first healthy node in order:** it then promotes the first **healthy** node in
+  list order (preferred/earliest first, skipping the dead one), retrying with exponential
+  backoff. Unreachable candidates are skipped. With `a,b,c`, if `b` is primary and dies it fails
+  back to `a` when `a` is healthy, and only reaches `c` if `a` is unhealthy or cannot be promoted.
+  It then monitors the new primary.
+- **Never exits on its own:** if no node can be promoted (whole cluster down) it keeps retrying
+  every interval until one can take over. It stops only on `SIGINT`/`SIGTERM`.
 
 All endpoints are `https` (Enterprise only).
 
@@ -326,7 +357,8 @@ sudo systemctl enable --now qdb-primary-watchdog
 journalctl -u qdb-primary-watchdog -f
 ```
 
-`Restart=always` brings it back on crash or after an all-nodes-down exit.
+`Restart=always` brings it back on crash (the watchdog no longer exits on its own, even when the
+whole cluster is down; it keeps retrying).
 
 **Run exactly one watchdog per cluster.** Two instances would try to promote different nodes and
 fight (split-brain). Put it on a separate monitoring host or one designated node.
