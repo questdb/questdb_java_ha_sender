@@ -5,16 +5,21 @@
 `mvn  -DskipTests clean package`
 
 The QuestDB client version is a Maven property (`questdb.client.version`, default
-`1.3.2`, the Maven Central release). The QWP (WebSocket) wire protocol differs
-between release and master builds, so the client **must match the target server
-build**. To ingest into a server built from master, build with:
+`1.3.6-SNAPSHOT`). This build **requires** it: the QWP transport and the lifecycle
+`switch` features used here (`switch status`, the current connection-event set) are
+not stable in earlier clients. `1.3.6-SNAPSHOT` is **not on Maven Central** — install
+it locally first, from the `feat/connect-timeout` branch of `java-questdb-client`:
 
 ```
-mvn -DskipTests clean package -Dquestdb.client.version=1.3.5-SNAPSHOT
+# in a checkout of java-questdb-client on feat/connect-timeout:
+mvn -DskipTests clean install
 ```
 
-A mismatch is not reported cleanly; it surfaces as `unknown msg_kind 0x18` or
-`invalid column type code: 0x0`, or as rows silently not landing.
+Then build this project normally (`mvn -DskipTests clean package`), or pin another
+build with `-Dquestdb.client.version=...`. The QWP (WebSocket) wire protocol **must
+match the target server build** — a mismatch is not reported cleanly; it surfaces as
+`unknown msg_kind 0x18` or `invalid column type code: 0x0`, or as rows silently not
+landing.
 
 ## Usage Example
 
@@ -29,11 +34,17 @@ java -jar target/ilp_sender-1.0-SNAPSHOT.jar \
 --csv ./trades20250728.csv.gz \
 --timestamp-from-file false \
 --retry-timeout 360000 \
+--connect-timeout-ms 3000 \
 --sender-id ha_sender \
 --store-forward-dir /tmp/qdb-sf \
 --batch-size 10000 \
 --batches-per-transaction 10
 ```
+
+`--retry-timeout` (default `360000` ms) is the overall "keep retrying" budget and applies to
+**both** transports: it drives `retryTimeoutMillis` on ILP and `reconnectMaxDurationMillis` on
+QWP. That is a different timeout from `--connect-timeout-ms` (below), which bounds a single
+connect attempt.
 
 ## Transport (`--protocol`)
 
@@ -59,6 +70,11 @@ QWP-only flags:
 - `--batches-per-transaction` (default `10`): an explicit `flush()` commits every
   `batch-size × batches-per-transaction` rows atomically per table. See
   [Commit cadence](#commit-cadence-freshness-vs-throughput) below.
+- `--connect-timeout-ms` (default `3000`, `0` uses the OS default): upper bound on a **single**
+  TCP connect attempt, for both the senders (`connectTimeoutMillis`) and the probe
+  (`connect_timeout=`). Without it a black-holed host (route accepts, never answers) rides the
+  OS connect timeout (~minutes) before failing over to the next `--addrs` host; with it, failover
+  happens in seconds. The ILP path is left unbounded so `--protocol ilp` stays identical.
 - `--probe-interval-ms` (default `1000`, `0` disables): interval for the probe thread
   that polls the latest ingested timestamp. See [Probe](#probe-qwp-only) below.
 - `--enterprise` (default `false`): request durable acks (`requestDurableAck`), holding
@@ -153,16 +169,25 @@ The **ingestion client** (one per worker) reports connection-state changes via t
 [ingestion client ha_sender-0] all endpoints unreachable, backing off
 ```
 
-(also `auth failed` and `reconnect budget exhausted` terminal states.)
+(also an `auth failed` terminal state; any other event kind the client emits is narrated
+generically by the `default` branch.)
 
-A missing or invalid ILP token is easy to misread: the QWP server refuses the WebSocket
-upgrade with a bare `HTTP/1.1 400 Bad request` (it never gets far enough to return a 401),
-so the raw client error mentions neither auth nor the token. Wherever that signature appears
-(the `endpoint ... failed` line and the fatal `Sender N got error` / `Worker failed` lines)
-the sender appends an explicit hint:
+A failed QWP WebSocket upgrade is otherwise hard to read from the raw client error, so
+wherever it surfaces (the `endpoint ... failed` line and the fatal `Sender N got error` /
+`Worker failed` lines) the sender appends a hint. It uses the client's **typed** signals, not
+string-matching, so it tells the causes apart:
+
+- **`QwpAuthFailedException` (HTTP 401/403)** — bad/expired credentials or missing permission:
+  `-- auth rejected (HTTP 401): bad/expired credentials or missing permission; check --token or --user/--password`
+- **`WebSocketUpgradeException.isRoleMismatch()` (HTTP 421)** — the endpoint is a replica, i.e.
+  no primary is available among `--addrs` to accept writes:
+  `-- endpoint is not writable (role=REPLICA): no primary available among --addrs to accept writes`
+- **`WebSocketUpgradeException` status 400** — a missing or malformed token (e.g. an unset token
+  env var); the server refuses the upgrade before it can return a 401:
+  `-- HTTP 400 on the upgrade: likely a missing or malformed ILP auth token (e.g. an unset token env var); check --token or --user/--password`
 
 ```
-Sender 0 got error: io.questdb.client...WebSocketUpgradeException: WebSocket upgrade failed: HTTP/1.1 400 Bad request -- likely a missing or invalid ILP auth token (the server refuses the WebSocket upgrade before it can return 401); check --token or --user/--password
+Sender 0 got error: io.questdb.client...WebSocketUpgradeException: WebSocket upgrade failed: HTTP/1.1 400 Bad request -- HTTP 400 on the upgrade: likely a missing or malformed ILP auth token (e.g. an unset token env var); check --token or --user/--password
 ```
 
 The **query client** (the probe) reports, prefixed `[query client]`:

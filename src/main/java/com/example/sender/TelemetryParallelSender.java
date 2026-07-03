@@ -522,9 +522,10 @@ public class TelemetryParallelSender {
                 case AUTH_FAILED:
                     msg = "auth failed for " + host;
                     break;
-                case RECONNECT_BUDGET_EXHAUSTED:
-                    msg = "reconnect budget exhausted, giving up";
-                    break;
+                // NOTE: no RECONNECT_BUDGET_EXHAUSTED case on purpose. That kind was dropped from
+                // the client's SenderConnectionEvent.Kind in newer builds (e.g. 1.3.6-SNAPSHOT), so
+                // switching on it fails to compile there. If a client still emits it, the default
+                // branch below narrates it generically.
                 case DISCONNECTED:
                     msg = "connection lost to " + host + " (" + cause + "), will retry";
                     noisy = true;

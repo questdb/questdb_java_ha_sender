@@ -76,6 +76,8 @@ SERVERS_CSV="${1:-${QDB_WD_SERVERS:-}}"
 TARGET_ROLE="${QDB_WD_TARGET_ROLE:-primary}"              # role to switch a node to on failover
 SWITCH_TIMEOUT_MS="${QDB_WD_SWITCH_TIMEOUT_MS:-5000}"     # timeout_ms in the switch payload
 STEPDOWN_CONNECT_TIMEOUT="${QDB_WD_STEPDOWN_CONNECT_TIMEOUT:-3}" # connect timeout (s) for the old-primary step-down
+CHECK_CONNECT_TIMEOUT="${QDB_WD_CHECK_CONNECT_TIMEOUT:-2}" # connect timeout (s) for each role/health poll
+CHECK_MAX_TIME="${QDB_WD_CHECK_MAX_TIME:-3}"             # overall max time (s) for each role/health poll
 FAIL_THRESHOLD="${QDB_WD_FAIL_THRESHOLD:-3}"              # consecutive non-primary reads before failover
 CHECK_INTERVAL="${QDB_WD_CHECK_INTERVAL:-1}"             # seconds between role checks
 GRACE_PERIOD="${QDB_WD_GRACE_PERIOD:-5}"                # seconds to wait after detecting loss before
@@ -106,7 +108,7 @@ fi
 
 # GET a node's /lifecycle. Prints the raw JSON, or nothing if unreachable.
 lifecycle_json() {
-  curl -ksS --connect-timeout 2 --max-time 3 \
+  curl -ksS --connect-timeout "$CHECK_CONNECT_TIMEOUT" --max-time "$CHECK_MAX_TIME" \
       -H "Authorization: Bearer $QDB_REST_TOKEN" \
       "https://$1/lifecycle" 2>/dev/null
 }

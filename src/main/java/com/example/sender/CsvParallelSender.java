@@ -3,6 +3,8 @@ package com.example.sender;
 import io.questdb.client.Sender;
 import io.questdb.client.Sender.LineSenderBuilder;
 import io.questdb.client.SenderConnectionListener;
+import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
+import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
@@ -44,6 +46,10 @@ public class CsvParallelSender {
     private static final String DEFAULT_PROTOCOL = "qwp";
     private static final String DEFAULT_SENDER_ID = "ha_sender";
     private static final String DEFAULT_STORE_FORWARD_DIR = "/tmp/qdb-sf";
+    // Upper bound (ms) on a single TCP connect attempt, so a black-holed host fails over fast
+    // instead of riding the OS connect timeout. 0 disables (falls back to the OS default).
+    // QWP + probe only; the ILP path is left untouched so --protocol ilp stays identical.
+    private static final int DEFAULT_CONNECT_TIMEOUT_MS = 3000;
     // Batch = one auto-flush append (deferred, no commit under transactional mode).
     // Transaction = batches-per-transaction batches, committed atomically per table
     // by an explicit flush(). See buildSender()/runWorker().
@@ -93,6 +99,9 @@ public class CsvParallelSender {
         // support it and the connection is rejected, so it is off by default.
         final boolean enterprise = Boolean.parseBoolean(a.getOrDefault("--enterprise", "false"));
         final String zone = a.getOrDefault("--zone", DEFAULT_ZONE);
+        // QWP + probe: bound a single TCP connect attempt (0 disables). ILP is left unchanged.
+        final int connectTimeoutMs = Integer.parseInt(a.getOrDefault("--connect-timeout-ms",
+                String.valueOf(DEFAULT_CONNECT_TIMEOUT_MS)));
 
         if (!protocol.equals("qwp") && !protocol.equals("ilp")) {
             System.err.println("--protocol must be 'qwp' or 'ilp', got: " + protocol);
@@ -100,6 +109,10 @@ public class CsvParallelSender {
         }
         if (probeIntervalMs < 0) {
             System.err.println("--probe-interval-ms must be >= 0 (0 disables the probe)");
+            System.exit(2);
+        }
+        if (connectTimeoutMs < 0) {
+            System.err.println("--connect-timeout-ms must be >= 0 (0 uses the OS connect timeout)");
             System.exit(2);
         }
         if (batchSize <= 0) {
@@ -125,13 +138,15 @@ public class CsvParallelSender {
         }
 
         final SenderCfg cfg = new SenderCfg(protocol, addrsCsv, token, username, password, retryTimeout,
-                senderIdBase, storeForwardDir, batchSize, batchesPerTransaction, numSenders, enterprise, zone);
+                senderIdBase, storeForwardDir, batchSize, batchesPerTransaction, numSenders, enterprise, zone,
+                connectTimeoutMs);
 
         final String conf = buildConf(addrsCsv, token, username, password, retryTimeout);
         System.out.println("Ingestion started. Protocol: " + protocol
                 + (protocol.equals("qwp")
                         ? " (WebSocket, sender-id=" + senderIdBase + ", store-and-forward=" + storeForwardDir
-                                + ", batch-size=" + batchSize + ", batches-per-transaction=" + batchesPerTransaction + ")"
+                                + ", batch-size=" + batchSize + ", batches-per-transaction=" + batchesPerTransaction
+                                + ", connect-timeout-ms=" + connectTimeoutMs + ", retry-timeout-ms=" + retryTimeout + ")"
                         : "")
                 + " | config: " + conf.replaceAll("(token=)([^;]+)", "$1***")
                 .replaceAll("(password=)([^;]+)", "$1***"));
@@ -186,7 +201,7 @@ public class CsvParallelSender {
             try {
                 f.get();
             } catch (ExecutionException ee) {
-                System.err.println("Worker failed: " + ee.getCause() + authHint(ee.getCause()));
+                System.err.println("Worker failed: " + ee.getCause() + upgradeHint(ee.getCause()));
                 System.exit(1);
             }
         }
@@ -271,7 +286,7 @@ public class CsvParallelSender {
             sender.flush();
             System.out.printf("Sender %d finished sending %d events%n", senderId, sent);
         } catch (Exception e) {
-            System.err.printf("Sender %d got error: %s%s%n", senderId, e.toString(), authHint(e));
+            System.err.printf("Sender %d got error: %s%s%n", senderId, e.toString(), upgradeHint(e));
             throw new RuntimeException(e);
         }
     }
@@ -430,15 +445,16 @@ public class CsvParallelSender {
                 case AUTH_FAILED:
                     msg = "auth failed for " + host;
                     break;
-                case RECONNECT_BUDGET_EXHAUSTED:
-                    msg = "reconnect budget exhausted, giving up";
-                    break;
+                // NOTE: no RECONNECT_BUDGET_EXHAUSTED case on purpose. That kind was dropped from
+                // the client's SenderConnectionEvent.Kind in newer builds (e.g. 1.3.6-SNAPSHOT), so
+                // switching on it fails to compile there. If a client still emits it, the default
+                // branch below narrates it generically.
                 case DISCONNECTED:
                     msg = "connection lost to " + host + " (" + cause + "), will retry";
                     noisy = true;
                     break;
                 case ENDPOINT_ATTEMPT_FAILED:
-                    msg = "endpoint " + host + " failed (" + cause + "), trying next" + authHint(cause);
+                    msg = "endpoint " + host + " failed (" + cause + "), trying next" + upgradeHint(event.getCause());
                     noisy = true;
                     break;
                 case ALL_ENDPOINTS_UNREACHABLE:
@@ -465,11 +481,18 @@ public class CsvParallelSender {
             b.requestDurableAck(true);
         }
 
+        // Bound a single TCP connect so a black-holed host fails over fast (0 = OS default).
+        if (cfg.connectTimeoutMs > 0) {
+            b.connectTimeoutMillis(cfg.connectTimeoutMs);
+        }
+
         return b.storeAndForwardDir(sfPath)
                 .senderId(who)
                 .transactional(true)
                 .connectionListener(connListener)
-                .reconnectMaxDurationMillis(300_000)
+                // reconnectMaxDurationMillis is the QWP analog of the ILP retryTimeoutMillis:
+                // the overall "keep retrying" budget. Driven by --retry-timeout on both transports.
+                .reconnectMaxDurationMillis(cfg.retryTimeout)
                 .reconnectInitialBackoffMillis(100)
                 .reconnectMaxBackoffMillis(5_000)
                 .autoFlushBytes(524_288)              // 512 KiB, under the ~1MB WS frame cap
@@ -502,6 +525,10 @@ public class CsvParallelSender {
         }
         if (tls) {
             sb.append("tls_verify=unsafe_off;");
+        }
+        // Bound the probe's TCP connect too, so it fails over as fast as the senders (0 = OS default).
+        if (cfg.connectTimeoutMs > 0) {
+            sb.append("connect_timeout=").append(cfg.connectTimeoutMs).append(';');
         }
         if (addrs.length > 1) {
             sb.append("failover=on;");
@@ -634,7 +661,7 @@ public class CsvParallelSender {
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
             } catch (Exception e) {
-                System.err.println("[probe] stopped: " + e.getMessage() + authHint(e));
+                System.err.println("[probe] stopped: " + e.getMessage() + upgradeHint(e));
             }
         }, "qwp-probe");
         t.setDaemon(true);
@@ -646,24 +673,31 @@ public class CsvParallelSender {
         return (s == null || s.isEmpty()) ? "(none)" : s;
     }
 
-    // A QWP server rejects a missing/invalid ILP auth token by refusing the WebSocket
-    // upgrade with a bare "HTTP/1.1 400 Bad request" (it never gets far enough to return
-    // a 401), which is impossible to diagnose from the raw message. Detect that signature
-    // and append an explicit hint. Returns "" when the text is not an upgrade-400.
-    private static String authHint(String m) {
-        if (m != null && m.contains("WebSocket upgrade failed") && m.contains("400")) {
-            return " -- likely a missing or invalid ILP auth token (the server refuses the"
-                    + " WebSocket upgrade before it can return 401); check --token or --user/--password";
-        }
-        return "";
-    }
-
-    // Same, but walks a throwable's cause chain (the upgrade failure is usually wrapped).
-    private static String authHint(Throwable t) {
+    // Turn a failed QWP WebSocket-upgrade throwable into a human-readable hint, using the
+    // client's TYPED signals rather than string-matching the message:
+    //   - QwpAuthFailedException  -> a definitive auth rejection (HTTP 401/403).
+    //   - WebSocketUpgradeException.isRoleMismatch() (HTTP 421) -> the endpoint is not writable
+    //     (a REPLICA / PRIMARY_CATCHUP), i.e. no primary is available among --addrs to accept writes.
+    //   - WebSocketUpgradeException with status 400 -> a missing/malformed auth token (e.g. an
+    //     unset token env var): the server refuses the upgrade before it can return a 401.
+    // Walks the cause chain (the upgrade failure is usually wrapped). Returns "" otherwise.
+    private static String upgradeHint(Throwable t) {
         for (Throwable c = t; c != null; c = c.getCause()) {
-            final String h = authHint(c.getMessage());
-            if (!h.isEmpty()) {
-                return h;
+            if (c instanceof QwpAuthFailedException) {
+                final QwpAuthFailedException a = (QwpAuthFailedException) c;
+                return " -- auth rejected (HTTP " + a.getStatusCode() + "): bad/expired credentials"
+                        + " or missing permission; check --token or --user/--password";
+            }
+            if (c instanceof WebSocketUpgradeException) {
+                final WebSocketUpgradeException w = (WebSocketUpgradeException) c;
+                if (w.isRoleMismatch()) {
+                    return " -- endpoint is not writable (role=" + w.getServerRole() + "): no primary"
+                            + " available among --addrs to accept writes";
+                }
+                if (w.getStatusCode() == 400) {
+                    return " -- HTTP 400 on the upgrade: likely a missing or malformed ILP auth token"
+                            + " (e.g. an unset token env var); check --token or --user/--password";
+                }
             }
         }
         return "";
@@ -724,6 +758,7 @@ public class CsvParallelSender {
                 case "--batch-size":
                 case "--batches-per-transaction":
                 case "--probe-interval-ms":
+                case "--connect-timeout-ms":
                 case "--enterprise":
                 case "--zone":
                     if (i + 1 >= args.length) {
@@ -762,10 +797,12 @@ public class CsvParallelSender {
         final int numSenders;
         final boolean enterprise;
         final String zone;
+        final int connectTimeoutMs;
 
         SenderCfg(String protocol, String addrsCsv, String token, String username, String password,
                   int retryTimeout, String senderIdBase, String storeForwardDir,
-                  int batchSize, int batchesPerTransaction, int numSenders, boolean enterprise, String zone) {
+                  int batchSize, int batchesPerTransaction, int numSenders, boolean enterprise, String zone,
+                  int connectTimeoutMs) {
             this.protocol = protocol;
             this.addrsCsv = addrsCsv;
             this.token = token;
@@ -779,6 +816,7 @@ public class CsvParallelSender {
             this.numSenders = numSenders;
             this.enterprise = enterprise;
             this.zone = zone;
+            this.connectTimeoutMs = connectTimeoutMs;
         }
     }
 }
