@@ -581,13 +581,25 @@ public class CsvParallelSender {
                                 orNone(info.getNodeId()), QwpServerInfo.roleName(info.getRole()), orNone(info.getZoneId()));
                     }
                 };
-                // Captures the live lifecycle role from `switch status`: joins every column whose
-                // name mentions "role" (current_role, target_role, ...) into e.g. "current_role=PRIMARY".
+                // `switch status` gives the LIVE lifecycle role of the serving node (authoritative
+                // even after an in-place demote, which getServerInfo() would miss). We join every
+                // column whose name mentions "role" (current_role, target_role, ...) into e.g.
+                // "current_role=PRIMARY". statusDiag captures WHY no role was produced, for a
+                // throttled log, so the empty case is diagnosable rather than silent.
                 final String[] liveRole = {null};
+                final String[] statusDiag = {null};
+                final long[] lastStatusDiagMs = {0L};
                 final QwpColumnBatchHandler statusHandler = new QwpColumnBatchHandler() {
                     @Override
                     public void onBatch(QwpColumnBatch batch) {
                         final int cols = batch.getColumnCount();
+                        final StringBuilder names = new StringBuilder();
+                        for (int c = 0; c < cols; c++) {
+                            if (names.length() > 0) {
+                                names.append(',');
+                            }
+                            names.append(batch.getColumnName(c));
+                        }
                         batch.forEachRow(row -> {
                             final StringBuilder sb = new StringBuilder();
                             for (int c = 0; c < cols; c++) {
@@ -604,6 +616,9 @@ public class CsvParallelSender {
                                 liveRole[0] = sb.toString();
                             }
                         });
+                        if (liveRole[0] == null) {
+                            statusDiag[0] = "'" + STATUS_QUERY + "' returned no *role* column; columns=[" + names + "]";
+                        }
                     }
 
                     @Override
@@ -612,8 +627,7 @@ public class CsvParallelSender {
 
                     @Override
                     public void onError(byte status, String message) {
-                        // e.g. OSS server without lifecycle, or insufficient permissions: leave
-                        // liveRole null so the probe falls back to the handshake node id.
+                        statusDiag[0] = "'" + STATUS_QUERY + "' error (status " + status + "): " + message;
                     }
 
                     @Override
@@ -623,6 +637,7 @@ public class CsvParallelSender {
                 while (!Thread.currentThread().isInterrupted()) {
                     latest[0] = Long.MIN_VALUE;
                     liveRole[0] = null;
+                    statusDiag[0] = null;
                     try {
                         client.execute(PROBE_QUERY, handler);
                         if (wasDown[0]) {
@@ -636,18 +651,31 @@ public class CsvParallelSender {
                             // look like a connection loss, so swallow it here (liveRole stays null).
                             try {
                                 client.execute(STATUS_QUERY, statusHandler);
-                            } catch (Exception ignore) {
-                                // fall through to the handshake fallback below
+                            } catch (Exception ex) {
+                                statusDiag[0] = "'" + STATUS_QUERY + "' threw: " + ex;
                             }
-                            final String served;
-                            if (liveRole[0] != null) {
-                                served = " served by " + liveRole[0] + " (live)";
-                            } else {
-                                final QwpServerInfo si = client.getServerInfo();
-                                served = si != null ? " served by node=" + orNone(si.getNodeId()) : "";
+                            if (liveRole[0] == null && statusDiag[0] == null) {
+                                statusDiag[0] = "'" + STATUS_QUERY + "' produced no row batch and no error"
+                                        + " (not a SELECT-style result on the read path?)";
                             }
+                            // Always show the client's known role (getServerInfo tracks connect and
+                            // failover); append the authoritative live role from switch status if we got it.
+                            final QwpServerInfo si = client.getServerInfo();
+                            final String base = si != null
+                                    ? " served by role=" + QwpServerInfo.roleName(si.getRole())
+                                            + " node=" + orNone(si.getNodeId()) + " zone=" + orNone(si.getZoneId())
+                                    : "";
+                            final String served = liveRole[0] != null ? base + " (live: " + liveRole[0] + ")" : base;
                             System.out.printf("[probe] latest trades timestamp = %s (raw=%d)%s%n",
                                     ts, latest[0], served);
+                            // Explain a missing live role at most once per 30s so it does not spam.
+                            if (liveRole[0] == null && statusDiag[0] != null) {
+                                final long now = System.currentTimeMillis();
+                                if (now - lastStatusDiagMs[0] > 30_000L) {
+                                    lastStatusDiagMs[0] = now;
+                                    System.out.println("[probe] live role unavailable: " + statusDiag[0]);
+                                }
+                            }
                         }
                     } catch (Exception e) {
                         if (!wasDown[0]) {
