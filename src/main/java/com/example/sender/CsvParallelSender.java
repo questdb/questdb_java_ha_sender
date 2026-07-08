@@ -581,12 +581,14 @@ public class CsvParallelSender {
                                 orNone(info.getNodeId()), QwpServerInfo.roleName(info.getRole()), orNone(info.getZoneId()));
                     }
                 };
-                // `switch status` gives the LIVE lifecycle role of the serving node (authoritative
-                // even after an in-place demote, which getServerInfo() would miss). We join every
-                // column whose name mentions "role" (current_role, target_role, ...) into e.g.
-                // "current_role=PRIMARY". statusDiag captures WHY no role was produced, for a
-                // throttled log, so the empty case is diagnosable rather than silent.
-                final String[] liveRole = {null};
+                // `switch status` reports the serving node's LIVE lifecycle role: current_role, plus
+                // target_role while a switch is in flight. This is authoritative -- unlike the QWP
+                // handshake role from getServerInfo(), it reflects an in-place promotion/demotion that
+                // never dropped the read connection. We show current_role as THE role; getServerInfo()
+                // only supplies node/zone, and its handshake role is a labelled fallback used solely
+                // when the status query is unavailable (e.g. missing SYSTEM ADMIN). statusDiag says why.
+                final String[] currentRole = {null};
+                final String[] targetRole = {null};
                 final String[] statusDiag = {null};
                 final long[] lastStatusDiagMs = {0L};
                 final QwpColumnBatchHandler statusHandler = new QwpColumnBatchHandler() {
@@ -601,23 +603,28 @@ public class CsvParallelSender {
                             names.append(batch.getColumnName(c));
                         }
                         batch.forEachRow(row -> {
-                            final StringBuilder sb = new StringBuilder();
                             for (int c = 0; c < cols; c++) {
                                 final String name = batch.getColumnName(c);
-                                if (name != null && name.toLowerCase(java.util.Locale.ROOT).contains("role")) {
-                                    if (sb.length() > 0) {
-                                        sb.append(' ');
-                                    }
-                                    sb.append(name).append('=')
-                                            .append(row.isNull(c) ? "(none)" : row.getString(c));
+                                if (name == null) {
+                                    continue;
+                                }
+                                final String lower = name.toLowerCase(java.util.Locale.ROOT);
+                                if (!lower.contains("role")) {
+                                    continue;
+                                }
+                                final String value = row.isNull(c) ? null : row.getString(c);
+                                if (lower.contains("current")) {
+                                    currentRole[0] = value;
+                                } else if (lower.contains("target")) {
+                                    targetRole[0] = value;
+                                } else if (currentRole[0] == null) {
+                                    // A single unqualified "role" column (older servers) is the current one.
+                                    currentRole[0] = value;
                                 }
                             }
-                            if (sb.length() > 0) {
-                                liveRole[0] = sb.toString();
-                            }
                         });
-                        if (liveRole[0] == null) {
-                            statusDiag[0] = "'" + STATUS_QUERY + "' returned no *role* column; columns=[" + names + "]";
+                        if (currentRole[0] == null) {
+                            statusDiag[0] = "'" + STATUS_QUERY + "' returned no current-role column; columns=[" + names + "]";
                         }
                     }
 
@@ -636,7 +643,8 @@ public class CsvParallelSender {
                 };
                 while (!Thread.currentThread().isInterrupted()) {
                     latest[0] = Long.MIN_VALUE;
-                    liveRole[0] = null;
+                    currentRole[0] = null;
+                    targetRole[0] = null;
                     statusDiag[0] = null;
                     try {
                         client.execute(PROBE_QUERY, handler);
@@ -648,28 +656,38 @@ public class CsvParallelSender {
                             // trades designated timestamp is microseconds by default.
                             Instant ts = Instant.EPOCH.plus(latest[0], ChronoUnit.MICROS);
                             // Ask the serving node for its live role. A status-query failure must not
-                            // look like a connection loss, so swallow it here (liveRole stays null).
+                            // look like a connection loss, so swallow it here (currentRole stays null).
                             try {
                                 client.execute(STATUS_QUERY, statusHandler);
                             } catch (Exception ex) {
                                 statusDiag[0] = "'" + STATUS_QUERY + "' threw: " + ex;
                             }
-                            if (liveRole[0] == null && statusDiag[0] == null) {
+                            if (currentRole[0] == null && statusDiag[0] == null) {
                                 statusDiag[0] = "'" + STATUS_QUERY + "' produced no row batch and no error"
                                         + " (not a SELECT-style result on the read path?)";
                             }
-                            // Always show the client's known role (getServerInfo tracks connect and
-                            // failover); append the authoritative live role from switch status if we got it.
+                            // Role comes from `switch status` (the authoritative live role of the serving
+                            // node). getServerInfo() only supplies node/zone here; its handshake role is a
+                            // labelled fallback used only when the status query is unavailable.
                             final QwpServerInfo si = client.getServerInfo();
-                            final String base = si != null
-                                    ? " served by role=" + QwpServerInfo.roleName(si.getRole())
-                                            + " node=" + orNone(si.getNodeId()) + " zone=" + orNone(si.getZoneId())
-                                    : "";
-                            final String served = liveRole[0] != null ? base + " (live: " + liveRole[0] + ")" : base;
+                            final String node = si != null ? orNone(si.getNodeId()) : "(none)";
+                            final String zone = si != null ? orNone(si.getZoneId()) : "(none)";
+                            final String served;
+                            if (currentRole[0] != null) {
+                                final boolean switching = targetRole[0] != null
+                                        && !targetRole[0].equalsIgnoreCase(currentRole[0]);
+                                served = " served by role=" + currentRole[0]
+                                        + (switching ? " (switching -> " + targetRole[0] + ")" : "")
+                                        + " node=" + node + " zone=" + zone;
+                            } else {
+                                final String handshake = si != null ? QwpServerInfo.roleName(si.getRole()) : "unknown";
+                                served = " served by role=" + handshake + " node=" + node + " zone=" + zone
+                                        + " (handshake role; live 'switch status' unavailable, may be stale)";
+                            }
                             System.out.printf("[probe] latest trades timestamp = %s (raw=%d)%s%n",
                                     ts, latest[0], served);
                             // Explain a missing live role at most once per 30s so it does not spam.
-                            if (liveRole[0] == null && statusDiag[0] != null) {
+                            if (currentRole[0] == null && statusDiag[0] != null) {
                                 final long now = System.currentTimeMillis();
                                 if (now - lastStatusDiagMs[0] > 30_000L) {
                                     lastStatusDiagMs[0] = now;
