@@ -121,16 +121,19 @@ runs `select timestamp from trades limit -1` over a **QWP query client** and is 
 independent of the senders, so it does not affect ingestion.
 
 ```
-[probe] latest trades timestamp = 2026-07-01T14:31:40.591545Z (raw=1782916300591545) served by current_role=PRIMARY target_role=PRIMARY (live)
+[probe] latest trades timestamp = 2026-07-01T14:31:40.591545Z (raw=1782916300591545) served by role=PRIMARY node=n1 zone=eu-west-1
 ```
 
-The `served by ... (live)` suffix is the **live** lifecycle role of the node currently
-answering the probe, obtained by running `switch status` on it each poll. This matters on
-failover: the QWP handshake `SERVER_INFO` (node/role) is only refreshed on a *reconnect*, so
-after an in-place primary&rarr;replica switch (which does not drop the read connection) it goes
-stale. `switch status` always reflects the truth, so the role you see flips the moment the
-serving node changes role. On a server without the lifecycle API (OSS), the status query is
-unavailable and the probe falls back to `served by node=<nodeId>` from the handshake.
+The `served by role=...` is the **live** lifecycle role (`current_role` from `switch status`)
+of the node currently answering the probe, run on it each poll. It is authoritative: the QWP
+handshake `SERVER_INFO` role is only refreshed on a *reconnect*, so after an in-place
+primary&rarr;replica switch (which does not drop the read connection) that role goes stale,
+whereas `switch status` always reflects the truth, so the role flips the moment the serving
+node changes role. `node`/`zone` come from the handshake `SERVER_INFO`. While a switch is in
+flight, `(switching -> ROLE)` is appended (the `target_role` differs from `current_role`). If
+the status query is unavailable (OSS, or the token lacks `SYSTEM ADMIN`), the probe falls back
+to the handshake role, explicitly labelled `(handshake role; live 'switch status' unavailable,
+may be stale)`.
 
 The query client uses the **same host list and token/auth** as the senders and enables
 **failover** when more than one host is given (`ws|wss::addr=h1,h2,...;...;failover=on`), so
@@ -362,8 +365,33 @@ export QDB_REST_TOKEN=...  QDB_WD_SERVERS=...  QDB_WD_FAIL_THRESHOLD=2
 ```
 
 The script auto-loads a config file if present (first of `/etc/qdb-primary-watchdog.env`,
-`~/.config/qdb-primary-watchdog.env`, or one beside the script; or `$QDB_WD_CONFIG`). See
-[`qdb-primary-watchdog.env.example`](./qdb-primary-watchdog.env.example) for every setting.
+`~/.config/qdb-primary-watchdog.env`, or one beside the script; or `$QDB_WD_CONFIG`).
+[`qdb-primary-watchdog.env.example`](./qdb-primary-watchdog.env.example) is a copy-ready
+template of the same settings.
+
+**Required (no defaults):**
+
+| Variable | Purpose |
+| --- | --- |
+| `QDB_REST_TOKEN` | Bearer token for the lifecycle REST API. |
+| `QDB_WD_SERVERS` | Ordered `host:9003,...` node list. The first CLI argument overrides it. |
+
+**Optional (defaults shown):**
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `QDB_WD_CONFIG` | *(auto-discover)* | Explicit path to the config file to load, bypassing discovery. |
+| `QDB_WD_TARGET_ROLE` | `primary` | Role a node is switched to on failover. |
+| `QDB_WD_SWITCH_TIMEOUT_MS` | `5000` | `timeout_ms` in the switch payload, and the promote backoff base. |
+| `QDB_WD_STEPDOWN_CONNECT_TIMEOUT` | `3` | Connect timeout (s) for the old-primary step-down; no overall timeout. |
+| `QDB_WD_CHECK_CONNECT_TIMEOUT` | `2` | Connect timeout (s) for each role/health poll. |
+| `QDB_WD_CHECK_MAX_TIME` | `3` | Overall max time (s) for each role/health poll. |
+| `QDB_WD_FAIL_THRESHOLD` | `3` | Consecutive non-primary reads before failover. |
+| `QDB_WD_CHECK_INTERVAL` | `1` | Seconds between role checks. |
+| `QDB_WD_GRACE_PERIOD` | `5` | Seconds to wait after detecting loss before acting (`0` disables), so a manual operator switch can settle; re-checked after. |
+| `QDB_WD_SWITCH_RETRIES` | `3` | Promote attempts, with exponential backoff between them. |
+| `QDB_WD_SWITCH_POLL_INTERVAL` | `1` | Seconds between lifecycle polls after a switch. |
+| `QDB_WD_SWITCH_POLL_MAX` | `30` | Max polls to wait for a switch to settle. |
 
 ### Run it as a service
 
