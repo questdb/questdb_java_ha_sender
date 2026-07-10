@@ -131,3 +131,20 @@ Smoke-tested against a local QuestDB (OSS) with all rows accounted for server-si
 | `qwpudp` | 2000 rows, 1 worker | 2000 / 2000 |
 | `qwp` | 5000 rows, 1 worker | 5000 / 5000, distinct per-row timestamps; probe reported live timestamps + role |
 | `qwp` | 20000 rows, 4 workers | 20000 / 20000, one store-and-forward dir per worker |
+
+### QWP failover (primary crash)
+
+Two servers from the same build (primary on `:9100`, fallback on `:9000`), a single-worker
+`qwp` run of 60000 rows with `--addrs :9100,:9000` and the probe active. The primary was
+hard-killed mid-run:
+
+- The sender **completed all 60000 rows with exit 0**, despite its primary crashing.
+- The primary took `trade_id` `0-1`…`0-20000`; the fallback took `0-20001`…`0-60000`
+  (40000 rows, all distinct). Combined: a **contiguous 1–60000 with zero loss and zero
+  duplication** — store-and-forward replayed the in-flight transaction to the new host and
+  the handoff landed exactly on a transaction boundary.
+- The probe kept reporting across the crash and reconnected to the fallback transparently.
+
+Note: the probe's `on_failover_reset` callback fires only on *mid-query* failover; its
+`limit -1` polls return in microseconds, so a between-poll reconnect is silent (no
+`failed over` line). Comparing `reader.current_addr()` across polls would surface it.
