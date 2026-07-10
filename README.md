@@ -5,16 +5,21 @@
 `mvn  -DskipTests clean package`
 
 The QuestDB client version is a Maven property (`questdb.client.version`, default
-`1.3.2`, the Maven Central release). The QWP (WebSocket) wire protocol differs
-between release and master builds, so the client **must match the target server
-build**. To ingest into a server built from master, build with:
+`1.3.6-SNAPSHOT`). This build **requires** it: the QWP transport and the lifecycle
+`switch` features used here (`switch status`, the current connection-event set) are
+not stable in earlier clients. `1.3.6-SNAPSHOT` is **not on Maven Central** — install
+it locally first, from the `feat/connect-timeout` branch of `java-questdb-client`:
 
 ```
-mvn -DskipTests clean package -Dquestdb.client.version=1.3.5-SNAPSHOT
+# in a checkout of java-questdb-client on feat/connect-timeout:
+mvn -DskipTests clean install
 ```
 
-A mismatch is not reported cleanly; it surfaces as `unknown msg_kind 0x18` or
-`invalid column type code: 0x0`, or as rows silently not landing.
+Then build this project normally (`mvn -DskipTests clean package`), or pin another
+build with `-Dquestdb.client.version=...`. The QWP (WebSocket) wire protocol **must
+match the target server build** — a mismatch is not reported cleanly; it surfaces as
+`unknown msg_kind 0x18` or `invalid column type code: 0x0`, or as rows silently not
+landing.
 
 ## Usage Example
 
@@ -29,21 +34,32 @@ java -jar target/ilp_sender-1.0-SNAPSHOT.jar \
 --csv ./trades20250728.csv.gz \
 --timestamp-from-file false \
 --retry-timeout 360000 \
+--connect-timeout-ms 3000 \
 --sender-id ha_sender \
 --store-forward-dir /tmp/qdb-sf \
 --batch-size 10000 \
 --batches-per-transaction 10
 ```
 
+`--retry-timeout` (default `360000` ms) is the overall "keep retrying" budget and applies to
+**both** transports: it drives `retryTimeoutMillis` on ILP and `reconnectMaxDurationMillis` on
+QWP. That is a different timeout from `--connect-timeout-ms` (below), which bounds a single
+connect attempt.
+
 ## Transport (`--protocol`)
 
 - `--protocol qwp` (default): QWP over WebSocket. Adds store-and-forward (un-acked
   frames spill to disk and replay after an outage) and transactional commit. Use the
   server's **HTTP port** (`:9000`) in `--addrs`.
-- `--protocol ilp`: the previous HTTP/ILP transport, unchanged. Ignores the QWP-only
-  flags below.
+- `--protocol qwpudp`: QWP over **UDP**, fire-and-forget datagram ingest. Use the
+  server's **UDP ingest port** (`:9007` by convention) in `--addrs`. It is **ingest-only,
+  unauthenticated, best-effort, and single-endpoint** (no failover). See
+  [QWP/UDP transport](#qwpudp-transport-best-effort-single-endpoint) for the full picture
+  and how to avoid packet loss.
+- `--protocol ilp`: the previous HTTP/ILP transport, unchanged. Ignores the
+  QWP/WebSocket-only flags below.
 
-QWP-only flags:
+QWP/WebSocket-only flags (`qwp`; ignored by `qwpudp` and `ilp`):
 
 - `--sender-id` (default `ha_sender`): store-and-forward key. **Must be unique per
   process/server**; set it explicitly when running more than one process on a host.
@@ -59,8 +75,13 @@ QWP-only flags:
 - `--batches-per-transaction` (default `10`): an explicit `flush()` commits every
   `batch-size × batches-per-transaction` rows atomically per table. See
   [Commit cadence](#commit-cadence-freshness-vs-throughput) below.
+- `--connect-timeout-ms` (default `3000`, `0` uses the OS default): upper bound on a **single**
+  TCP connect attempt, for both the senders (`connectTimeoutMillis`) and the probe
+  (`connect_timeout=`). Without it a black-holed host (route accepts, never answers) rides the
+  OS connect timeout (~minutes) before failing over to the next `--addrs` host; with it, failover
+  happens in seconds. The ILP path is left unbounded so `--protocol ilp` stays identical.
 - `--probe-interval-ms` (default `1000`, `0` disables): interval for the probe thread
-  that polls the latest ingested timestamp. See [Probe](#probe-qwp-only) below.
+  that polls the latest ingested timestamp. See [Probe](#probe-qwpwebsocket-only) below.
 - `--enterprise` (default `false`): request durable acks (`requestDurableAck`), holding
   spilled frames until the server confirms a durable commit. **Enterprise only**: an OSS
   server rejects the WebSocket upgrade, so leave it off against OSS. See
@@ -69,6 +90,51 @@ QWP-only flags:
   to its connect string as `zone=`. Biases failover toward same-zone instances on
   Enterprise; a no-op on OSS. The ingestion path is zone-blind (it must follow the
   primary), so this does not affect the senders.
+
+## QWP/UDP transport (best-effort, single endpoint)
+
+`--protocol qwpudp` sends rows as UDP datagrams to the server's UDP ingest port (`:9007`
+by convention; put it in `--addrs`). The server must have UDP ingest enabled, and it
+accepts **any** connection on that port. It is the simplest and lowest-overhead
+transport, at the cost of every reliability guarantee the other two provide.
+
+**Ingest-only, unauthenticated.** There is no query path, so the probe is not started and
+`--probe-interval-ms` is ignored. UDP rejects authentication: `--token`, `--username`, and
+`--password` are ignored (with a warning). Store-and-forward, TLS, and durable ack do not
+apply.
+
+**Single endpoint, no failover.** UDP is connectionless and unacknowledged: there is no
+connection to detect as dropped and no delivery feedback, so the client cannot know a host
+is down and therefore **cannot fail over**. The client enforces this by rejecting more than
+one address:
+
+```
+only a single address (host:port) is supported for UDP transport
+```
+
+Pass exactly one `host:9007`. If that host is down, datagrams are silently lost. For high
+availability across hosts use `qwp` (WebSocket store-and-forward) or `ilp` (HTTP retry).
+
+**Best-effort: datagrams can be dropped.** There is no ack, no retransmit, and no
+store-and-forward, so a lost datagram is a lost row. UDP also has **no backpressure**: if
+the sender emits datagrams faster than the server drains its OS receive buffer, the buffer
+overflows and datagrams are dropped **wholesale**, not one at a time.
+
+That burst sensitivity is the main thing to tune. Rows are flushed to datagrams every
+`--batch-size` rows, so a large batch flushed all at once (especially by several workers
+finishing together) is exactly the burst that overflows the buffer. Observed on loopback:
+
+| Config | Result |
+| --- | --- |
+| `--num-senders 4 --batch-size 10000` (one big burst per worker) | **0 of 8000 rows landed** |
+| `--num-senders 4 --batch-size 100` (paced, small flushes) | **8000 of 8000 rows landed** |
+
+So for UDP, **keep `--batch-size` small** (e.g. `100`-`500`) to pace the datagrams, and if
+you still see loss, raise the OS UDP receive-buffer size on the server host
+(`net.core.rmem_max` / `rmem_default` on Linux). Even then, treat UDP as best-effort:
+enable dedup and reconcile counts if you need to know what landed. Timestamp behavior is
+the same as the other transports (a single worker stamps client-side micros; multiple
+workers use server-side `atNow()`; see [Timestamps](#timestamps-and-throughput)).
 
 ## Commit cadence (freshness vs throughput)
 
@@ -97,24 +163,35 @@ seconds between commits (per worker) = (batch-size × batches-per-transaction) /
   for many seconds. Keep `--batches-per-transaction` small when freshness matters more
   than raw throughput.
 
-## Probe (QWP only)
+## Probe (QWP/WebSocket only)
 
-When the transport is QWP, a separate thread polls the latest ingested timestamp and
+When the transport is `qwp` (WebSocket), a separate thread polls the latest ingested timestamp and
 prints it to stdout once per `--probe-interval-ms` (default `1000` ms; `0` disables). It
 runs `select timestamp from trades limit -1` over a **QWP query client** and is fully
 independent of the senders, so it does not affect ingestion.
 
 ```
-[probe] latest trades timestamp = 2026-07-01T14:31:40.591545Z (raw=1782916300591545)
+[probe] latest trades timestamp = 2026-07-01T14:31:40.591545Z (raw=1782916300591545) served by role=PRIMARY node=n1 zone=eu-west-1
 ```
+
+The `served by role=...` is the **live** lifecycle role (`current_role` from `switch status`)
+of the node currently answering the probe, run on it each poll. It is authoritative: the QWP
+handshake `SERVER_INFO` role is only refreshed on a *reconnect*, so after an in-place
+primary&rarr;replica switch (which does not drop the read connection) that role goes stale,
+whereas `switch status` always reflects the truth, so the role flips the moment the serving
+node changes role. `node`/`zone` come from the handshake `SERVER_INFO`. While a switch is in
+flight, `(switching -> ROLE)` is appended (the `target_role` differs from `current_role`). If
+the status query is unavailable (OSS, or the token lacks `SYSTEM ADMIN`), the probe falls back
+to the handshake role, explicitly labelled `(handshake role; live 'switch status' unavailable,
+may be stale)`.
 
 The query client uses the **same host list and token/auth** as the senders and enables
 **failover** when more than one host is given (`ws|wss::addr=h1,h2,...;...;failover=on`), so
 if a host stops responding it moves to the next one automatically and narrates the
 transition (see [Failover and connection narration](#failover-and-connection-narration-qwp)).
 Before the `trades` table exists it prints `[query client] server error: table does not
-exist` each interval, then switches to timestamps once ingestion begins. ILP ignores
-`--probe-interval-ms`.
+exist` each interval, then switches to timestamps once ingestion begins. `ilp` and
+`qwpudp` ignore `--probe-interval-ms` (neither has a query path).
 
 On connect the probe prints the instance actually serving it:
 
@@ -145,7 +222,26 @@ The **ingestion client** (one per worker) reports connection-state changes via t
 [ingestion client ha_sender-0] all endpoints unreachable, backing off
 ```
 
-(also `auth failed` and `reconnect budget exhausted` terminal states.)
+(also an `auth failed` terminal state; any other event kind the client emits is narrated
+generically by the `default` branch.)
+
+A failed QWP WebSocket upgrade is otherwise hard to read from the raw client error, so
+wherever it surfaces (the `endpoint ... failed` line and the fatal `Sender N got error` /
+`Worker failed` lines) the sender appends a hint. It uses the client's **typed** signals, not
+string-matching, so it tells the causes apart:
+
+- **`QwpAuthFailedException` (HTTP 401/403)** — bad/expired credentials or missing permission:
+  `-- auth rejected (HTTP 401): bad/expired credentials or missing permission; check --token or --user/--password`
+- **`WebSocketUpgradeException.isRoleMismatch()` (HTTP 421)** — the endpoint is a replica, i.e.
+  no primary is available among `--addrs` to accept writes:
+  `-- endpoint is not writable (role=REPLICA): no primary available among --addrs to accept writes`
+- **`WebSocketUpgradeException` status 400** — a missing or malformed token (e.g. an unset token
+  env var); the server refuses the upgrade before it can return a 401:
+  `-- HTTP 400 on the upgrade: likely a missing or malformed ILP auth token (e.g. an unset token env var); check --token or --user/--password`
+
+```
+Sender 0 got error: io.questdb.client...WebSocketUpgradeException: WebSocket upgrade failed: HTTP/1.1 400 Bad request -- HTTP 400 on the upgrade: likely a missing or malformed ILP auth token (e.g. an unset token env var); check --token or --user/--password
+```
 
 The **query client** (the probe) reports, prefixed `[query client]`:
 
@@ -185,6 +281,36 @@ default path stamps each row with the current microsecond **client-side**
 timestamps, so O3 is still avoided, and this sidesteps the per-batch stamping above
 (giving near-distinct per-row timestamps). ILP, or QWP with more than one worker, keep
 using server-side `atNow()`, which stays O3-safe across concurrent senders.
+
+## Row id and dedup (`trade_id`)
+
+Every row the trades sender writes carries a `trade_id` column of the form
+`<worker>-<sequence>` (for example `0-1`, `0-2`, ...), where the sequence is 1-based and
+monotonic per sender. It is a high-cardinality **VARCHAR**, deliberately not a symbol (each
+row is unique, so a symbol column would blow up the symbol table).
+
+Two uses:
+
+- **Completeness check, timestamp-independent.** Each sender emits a contiguous `1..N`, so you
+  can confirm nothing was lost and spot gaps regardless of how rows were timestamped.
+- **Idempotent replay via dedup.** Store-and-forward is at-least-once: on a failover the client
+  replays the un-acked in-flight transaction to the new primary, re-writing the rows the old
+  primary had already durably persisted (send 100,000 rows, kill the primary mid-transaction,
+  and you land ~100,101). Enabling dedup collapses those back to exactly once:
+
+  ```sql
+  ALTER TABLE trades DEDUP ENABLE UPSERT KEYS(timestamp, trade_id);
+  ```
+
+  Dedup keys must include the designated timestamp, so the match is on `(timestamp, trade_id)`.
+  `trade_id` also keeps legitimately-distinct rows that share a microsecond apart (common at
+  millions of rows/s), which a `(symbol, side, timestamp)` key alone would wrongly merge.
+
+**Requirement:** dedup only catches replays when the row carries a **client-side timestamp**, so
+the timestamp is baked into the spilled frame and reproduced identically on replay. That means a
+single worker (the default `at(Instant.now())` path) or `--timestamp-from-file` /
+`--seconds-offset`. Under multi-worker `atNow()` the new primary assigns a fresh timestamp on
+replay and dedup cannot match. See [Timestamps and throughput](#timestamps-and-throughput).
 
 ## Benchmarking throughput
 
@@ -242,22 +368,35 @@ QWP WebSocket transport.
 ## Primary failover watchdog
 
 `qdb-primary-watchdog.sh` is a standalone Bash watchdog for an Enterprise cluster. Give it the
-ordered list of every node's lifecycle admin endpoint (`host:9003`); it finds the current
-primary, health-checks it, and on failure promotes another node via the lifecycle REST API.
+ordered list of every node's lifecycle admin endpoint (`host:9003`); it finds (or, on a
+fresh cluster, elects) the current primary, monitors its role, and on failure promotes another
+node via the lifecycle REST API.
 
 Behaviour:
 
-- **Detect:** on startup it sweeps the list and monitors whichever node reports
-  `currentRole:PRIMARY`.
-- **Step down first:** when the primary stops responding it first sends a best-effort
-  `{"role":"replica"}` to the old primary, so a false positive (it is actually still up) cannot
-  leave two primaries.
-- **Promote in order:** it then promotes the first reachable node in list order (earliest first,
-  skipping the dead one), retrying with exponential backoff. With `a,b,c`, if `b` is primary and
-  dies it fails back to `a` when `a` is available, and only reaches `c` if `a` cannot be promoted.
-  It then monitors the newly promoted node, repeating indefinitely.
-- **Give up:** exits only if no node can be promoted (whole cluster down), or if no primary is
-  found at startup. Under systemd it is then restarted and re-detects the primary.
+- **Detect / bootstrap:** on startup it sweeps the list and monitors whichever node reports
+  `currentRole:PRIMARY`. If **no** node is primary yet (a freshly-started cluster) it promotes
+  the first healthy node in list order, so the cluster always ends up with a primary. If every
+  node is unhealthy it keeps retrying rather than exiting. Split-brain is not a concern here:
+  QuestDB stops the offending node if two ever claim primary.
+- **Monitor the role, not just health:** each interval it reads the primary's `currentRole`.
+  A node that stops responding **or** is silently demoted to `REPLICA` out-of-band both count
+  as a failure, so it reacts to a demotion even while the node is still reachable.
+- **Grace period:** after detecting loss it waits `QDB_WD_GRACE_PERIOD` seconds (default `5`,
+  `0` disables) before acting, then re-checks. This lets an operator do a manual switch (demote
+  the primary, promote a replica) without the watchdog racing them, as long as it completes
+  within the window.
+- **Adopt if already switched:** it then re-checks the cluster; if another node is already
+  `PRIMARY` (an operator switch, or the old primary recovered) it simply adopts it, no new switch.
+- **Step down first:** otherwise it sends a best-effort `{"role":"replica"}` to the old primary,
+  so a false positive (it is actually still up) cannot leave two primaries.
+- **Promote the first healthy node in order:** it then promotes the first **healthy** node in
+  list order (preferred/earliest first, skipping the dead one), retrying with exponential
+  backoff. Unreachable candidates are skipped. With `a,b,c`, if `b` is primary and dies it fails
+  back to `a` when `a` is healthy, and only reaches `c` if `a` is unhealthy or cannot be promoted.
+  It then monitors the new primary.
+- **Never exits on its own:** if no node can be promoted (whole cluster down) it keeps retrying
+  every interval until one can take over. It stops only on `SIGINT`/`SIGTERM`.
 
 All endpoints are `https` (Enterprise only).
 
@@ -276,8 +415,33 @@ export QDB_REST_TOKEN=...  QDB_WD_SERVERS=...  QDB_WD_FAIL_THRESHOLD=2
 ```
 
 The script auto-loads a config file if present (first of `/etc/qdb-primary-watchdog.env`,
-`~/.config/qdb-primary-watchdog.env`, or one beside the script; or `$QDB_WD_CONFIG`). See
-[`qdb-primary-watchdog.env.example`](./qdb-primary-watchdog.env.example) for every setting.
+`~/.config/qdb-primary-watchdog.env`, or one beside the script; or `$QDB_WD_CONFIG`).
+[`qdb-primary-watchdog.env.example`](./qdb-primary-watchdog.env.example) is a copy-ready
+template of the same settings.
+
+**Required (no defaults):**
+
+| Variable | Purpose |
+| --- | --- |
+| `QDB_REST_TOKEN` | Bearer token for the lifecycle REST API. |
+| `QDB_WD_SERVERS` | Ordered `host:9003,...` node list. The first CLI argument overrides it. |
+
+**Optional (defaults shown):**
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `QDB_WD_CONFIG` | *(auto-discover)* | Explicit path to the config file to load, bypassing discovery. |
+| `QDB_WD_TARGET_ROLE` | `primary` | Role a node is switched to on failover. |
+| `QDB_WD_SWITCH_TIMEOUT_MS` | `5000` | `timeout_ms` in the switch payload, and the promote backoff base. |
+| `QDB_WD_STEPDOWN_CONNECT_TIMEOUT` | `3` | Connect timeout (s) for the old-primary step-down; no overall timeout. |
+| `QDB_WD_CHECK_CONNECT_TIMEOUT` | `2` | Connect timeout (s) for each role/health poll. |
+| `QDB_WD_CHECK_MAX_TIME` | `3` | Overall max time (s) for each role/health poll. |
+| `QDB_WD_FAIL_THRESHOLD` | `3` | Consecutive non-primary reads before failover. |
+| `QDB_WD_CHECK_INTERVAL` | `1` | Seconds between role checks. |
+| `QDB_WD_GRACE_PERIOD` | `5` | Seconds to wait after detecting loss before acting (`0` disables), so a manual operator switch can settle; re-checked after. |
+| `QDB_WD_SWITCH_RETRIES` | `3` | Promote attempts, with exponential backoff between them. |
+| `QDB_WD_SWITCH_POLL_INTERVAL` | `1` | Seconds between lifecycle polls after a switch. |
+| `QDB_WD_SWITCH_POLL_MAX` | `30` | Max polls to wait for a switch to settle. |
 
 ### Run it as a service
 
@@ -296,7 +460,8 @@ sudo systemctl enable --now qdb-primary-watchdog
 journalctl -u qdb-primary-watchdog -f
 ```
 
-`Restart=always` brings it back on crash or after an all-nodes-down exit.
+`Restart=always` brings it back on crash (the watchdog no longer exits on its own, even when the
+whole cluster is down; it keeps retrying).
 
 **Run exactly one watchdog per cluster.** Two instances would try to promote different nodes and
 fight (split-brain). Put it on a separate monitoring host or one designated node.

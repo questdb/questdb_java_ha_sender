@@ -10,13 +10,15 @@
   <properties>
     <maven.compiler.source>11</maven.compiler.source>
     <maven.compiler.target>11</maven.compiler.target>
-    <!-- Default = Maven Central release (cluster/demo). Override with
-         -Dquestdb.client.version=1.3.5-SNAPSHOT to test a local master build
-         (questdb-client installed via mvn clean install). The QWP wire protocol
-         differs between release and master, so the client MUST match the server
-         build, not its reported version. A mismatch shows up as
-         "unknown msg_kind 0x18" or "invalid column type code: 0x0". -->
-    <questdb.client.version>1.3.2</questdb.client.version>
+    <!-- 1.3.6-SNAPSHOT is required: the QWP transport and the lifecycle "switch"
+         changes this project depends on (e.g. `switch status`, the connection-event
+         set without RECONNECT_BUDGET_EXHAUSTED) are not stable in earlier builds.
+         It is NOT on Maven Central; install it locally first with `mvn clean install`
+         from the java-questdb-client `feat/connect-timeout` branch, then build here.
+         The QWP wire protocol must match the SERVER build, not its reported version;
+         a mismatch shows up as "unknown msg_kind 0x18" or "invalid column type code:
+         0x0". Override with -Dquestdb.client.version=... to pin a different build. -->
+    <questdb.client.version>1.3.6-SNAPSHOT</questdb.client.version>
   </properties>
 
   <dependencies>

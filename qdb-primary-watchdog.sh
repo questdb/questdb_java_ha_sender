@@ -4,11 +4,17 @@
 # Watches an Enterprise cluster for primary failure and promotes the next node.
 #
 # Give it the ordered list of lifecycle admin endpoints (host:9003) of ALL nodes. On start it
-# finds which one currently reports role PRIMARY and health-monitors it. When that primary
-# stops responding, it promotes the first reachable node in list order (earliest first,
-# skipping the failed one) via POST /lifecycle/switch, waits for the switch to settle, then
-# monitors the newly promoted node. If no node can be promoted (the whole cluster is down),
-# it exits.
+# finds which one currently reports role PRIMARY and monitors it; if none is primary yet it
+# promotes the first healthy node in list order, so a freshly-started cluster gets a primary.
+# (Split-brain is not a concern: QuestDB stops the offending node if two ever claim primary.)
+# Monitoring is role-based, not
+# just a health ping: each interval it reads the node's currentRole, so it reacts both to the
+# primary going unreachable AND to it being silently demoted to a replica out-of-band. When the
+# primary is lost it first re-checks whether the cluster already has a primary (e.g. an operator
+# switch) and adopts it; otherwise it asks the old primary to step down and promotes the first
+# HEALTHY node in list order (preferred first, skipping the failed one) via POST /lifecycle/switch,
+# waits for the switch to settle, then monitors the new primary. It never exits on its own: if no
+# primary exists yet, or none can be promoted, it keeps retrying every check interval.
 #
 # Required, no defaults: the node list and QDB_REST_TOKEN. The node list comes from the first
 # CLI arg or $QDB_WD_SERVERS; the token from $QDB_REST_TOKEN. Everything else has a default
@@ -70,9 +76,13 @@ SERVERS_CSV="${1:-${QDB_WD_SERVERS:-}}"
 TARGET_ROLE="${QDB_WD_TARGET_ROLE:-primary}"              # role to switch a node to on failover
 SWITCH_TIMEOUT_MS="${QDB_WD_SWITCH_TIMEOUT_MS:-5000}"     # timeout_ms in the switch payload
 STEPDOWN_CONNECT_TIMEOUT="${QDB_WD_STEPDOWN_CONNECT_TIMEOUT:-3}" # connect timeout (s) for the old-primary step-down
-FAIL_THRESHOLD="${QDB_WD_FAIL_THRESHOLD:-3}"              # consecutive health failures before failover
-CHECK_INTERVAL="${QDB_WD_CHECK_INTERVAL:-1}"             # seconds between health checks
-STARTUP_RETRIES="${QDB_WD_STARTUP_RETRIES:-3}"          # sweeps to find the initial primary before giving up
+CHECK_CONNECT_TIMEOUT="${QDB_WD_CHECK_CONNECT_TIMEOUT:-2}" # connect timeout (s) for each role/health poll
+CHECK_MAX_TIME="${QDB_WD_CHECK_MAX_TIME:-3}"             # overall max time (s) for each role/health poll
+FAIL_THRESHOLD="${QDB_WD_FAIL_THRESHOLD:-3}"              # consecutive non-primary reads before failover
+CHECK_INTERVAL="${QDB_WD_CHECK_INTERVAL:-1}"             # seconds between role checks
+GRACE_PERIOD="${QDB_WD_GRACE_PERIOD:-5}"                # seconds to wait after detecting loss before
+                                                         # acting, so a manual operator switch can settle
+                                                         # (re-checked afterwards; 0 disables the wait)
 SWITCH_RETRIES="${QDB_WD_SWITCH_RETRIES:-3}"            # retries if a switch POST is not accepted
 SWITCH_POLL_INTERVAL="${QDB_WD_SWITCH_POLL_INTERVAL:-1}" # seconds between lifecycle polls after a switch
 SWITCH_POLL_MAX="${QDB_WD_SWITCH_POLL_MAX:-30}"         # max polls to wait for a switch to settle
@@ -98,7 +108,7 @@ fi
 
 # GET a node's /lifecycle. Prints the raw JSON, or nothing if unreachable.
 lifecycle_json() {
-  curl -ksS --connect-timeout 2 --max-time 3 \
+  curl -ksS --connect-timeout "$CHECK_CONNECT_TIMEOUT" --max-time "$CHECK_MAX_TIME" \
       -H "Authorization: Bearer $QDB_REST_TOKEN" \
       "https://$1/lifecycle" 2>/dev/null
 }
@@ -112,17 +122,6 @@ get_role() {
     nospace="${nospace#*'"currentRole":"'}"
     printf '%s' "${nospace%%'"'*}"
   fi
-}
-
-# Health ping. Prints the HTTP code, or 000 if there was no response at all.
-get_http_code() {
-  local code rc
-  code="$(curl -ksS -o /dev/null -w '%{http_code}' \
-      -H "Authorization: Bearer $QDB_REST_TOKEN" \
-      --connect-timeout 2 --max-time 3 "https://$1/lifecycle" 2>/dev/null)"
-  rc=$?
-  (( rc != 0 )) && code="000"
-  printf '%s' "$code"
 }
 
 # Poll a node's /lifecycle until its switch settles and it reports the target role.
@@ -207,14 +206,26 @@ find_primary() {
   return 1
 }
 
-# Promote the first reachable node in list order (earliest wins), skipping the current
-# (failed) primary. So with a,b,c where b is primary and dies, it tries a first, then c;
-# it only reaches c if a cannot be promoted. Sets FOUND_IDX, returns 0/1.
+# Promote the first HEALTHY node in list order (earliest/preferred wins), skipping the current
+# (failed) primary. So with a,b,c where b is primary and dies, it tries a first, then c; it only
+# reaches c if a is unhealthy or cannot be promoted. Each candidate's role is read first: an
+# unreachable node is skipped, a node that is already PRIMARY is adopted as-is (an out-of-band
+# switch beat us to it), and a healthy replica is promoted. Sets FOUND_IDX, returns 0/1.
 failover_from() {
-  local cur="$1" n="${#SERVERS[@]}" i
+  local cur="$1" n="${#SERVERS[@]}" i role
   for (( i=0; i<n; i++ )); do
     (( i == cur )) && continue          # never fail back to the node that just died
-    log "Attempting failover to ${SERVERS[$i]} (index $i)"
+    role="$(get_role "${SERVERS[$i]}")"
+    if [[ -z "$role" ]]; then
+      log "  ${SERVERS[$i]} (index $i) unreachable, skipping"
+      continue
+    fi
+    if [[ "$role" == "PRIMARY" ]]; then
+      log "  ${SERVERS[$i]} (index $i) is already PRIMARY, adopting"
+      FOUND_IDX=$i
+      return 0
+    fi
+    log "Attempting failover to ${SERVERS[$i]} (index $i, role=$role)"
     if promote "${SERVERS[$i]}"; then
       FOUND_IDX=$i
       return 0
@@ -224,44 +235,76 @@ failover_from() {
   return 1
 }
 
+# Ensure the cluster has a primary: adopt an existing one if present, otherwise promote the first
+# healthy node in list order (nothing to skip -- pass -1). Used at startup so a cluster that comes
+# up with no primary at all gets one. Split-brain is not a concern: QuestDB stops the offending
+# node if two ever claim primary. Sets ENSURED_IDX and returns 0, or returns 1 if none could be
+# made primary (all nodes unhealthy).
+ensure_primary() {
+  if find_primary; then
+    ENSURED_IDX=$FOUND_IDX
+    return 0
+  fi
+  log "No node is PRIMARY; promoting the first healthy node in list order"
+  if failover_from -1; then
+    ENSURED_IDX=$FOUND_IDX
+    return 0
+  fi
+  return 1
+}
+
 main() {
   log "Cluster (${#SERVERS[@]} nodes): ${SERVERS[*]}"
   log "Detecting current primary..."
-  local cur attempt=1
-  until find_primary; do
-    if (( attempt >= STARTUP_RETRIES )); then
-      log "ERROR: no PRIMARY found among the nodes after $STARTUP_RETRIES sweeps. Exiting."
-      exit 1
-    fi
-    (( attempt++ ))
-    log "No primary yet, retrying sweep ($attempt/$STARTUP_RETRIES)..."
+  local cur
+  # Startup: ensure the cluster has a primary. Adopt an existing one, or promote the first healthy
+  # node if none is primary yet. If every node is unhealthy, keep retrying -- never exit.
+  until ensure_primary; do
+    log "No primary and none could be promoted yet; retrying in ${CHECK_INTERVAL}s (will not exit)..."
     sleep "$CHECK_INTERVAL"
   done
-  cur=$FOUND_IDX
+  cur=$ENSURED_IDX
   log "Primary is ${SERVERS[$cur]} (index $cur). Monitoring every ${CHECK_INTERVAL}s (threshold $FAIL_THRESHOLD)."
 
-  local fail_count=0 code
+  local fail_count=0 role
   while true; do
-    code="$(get_http_code "${SERVERS[$cur]}")"
-    # Any HTTP reply means the primary is alive; only a no-response (000) counts as down.
-    if [[ "$code" == "000" ]]; then
-      (( fail_count++ ))
-      log "Primary ${SERVERS[$cur]} unreachable, no HTTP response (fails: $fail_count/$FAIL_THRESHOLD)"
-    else
-      (( fail_count > 0 )) && log "Primary ${SERVERS[$cur]} responding again (HTTP $code), resetting"
+    # Role-based check: the primary counts as healthy only while it still reports PRIMARY.
+    # An unreachable node (empty role) or a silent demotion to REPLICA both count as failures.
+    role="$(get_role "${SERVERS[$cur]}")"
+    if [[ "$role" == "PRIMARY" ]]; then
+      (( fail_count > 0 )) && log "Primary ${SERVERS[$cur]} healthy again (role=PRIMARY), resetting"
       fail_count=0
+    else
+      (( fail_count++ ))
+      log "Primary ${SERVERS[$cur]} not serving as primary (role=${role:-unreachable}) (fails: $fail_count/$FAIL_THRESHOLD)"
     fi
 
     if (( fail_count >= FAIL_THRESHOLD )); then
-      log "Primary ${SERVERS[$cur]} is down, initiating failover"
-      demote_to_replica "${SERVERS[$cur]}"   # first, try to make the old primary stand down
-      if failover_from "$cur"; then
+      log "Primary ${SERVERS[$cur]} lost; initiating failover"
+      # Grace period: give an operator doing a manual switch (demote the old primary, promote a
+      # replica) a few seconds to finish before we act, so the watchdog does not race them. After
+      # the wait we re-check the cluster; if a primary is now present we simply adopt it below.
+      if (( GRACE_PERIOD > 0 )); then
+        log "  grace period: waiting ${GRACE_PERIOD}s for a manual switch to settle before acting"
+        sleep "$GRACE_PERIOD"
+      fi
+      # The cluster may already have a new primary (operator switch, or cur recovered elsewhere in
+      # the list): adopt it instead of forcing another switch.
+      if find_primary; then
         cur=$FOUND_IDX
         fail_count=0
-        log "New primary is ${SERVERS[$cur]} (index $cur). Monitoring."
+        log "Cluster already has a PRIMARY: ${SERVERS[$cur]} (index $cur). Monitoring it."
       else
-        log "ERROR: no node could be promoted (whole cluster appears down). Exiting."
-        exit 1
+        demote_to_replica "${SERVERS[$cur]}"   # best-effort: make the old primary stand down first
+        if failover_from "$cur"; then
+          cur=$FOUND_IDX
+          fail_count=0
+          log "New primary is ${SERVERS[$cur]} (index $cur). Monitoring."
+        else
+          # No healthy node to promote. Do NOT exit: leave fail_count armed so the next tick
+          # retries the whole failover, and keep going until some node can take over.
+          log "No healthy node could be promoted; will keep retrying every ${CHECK_INTERVAL}s (not exiting)"
+        fi
       fi
     fi
 

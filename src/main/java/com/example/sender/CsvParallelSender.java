@@ -3,6 +3,8 @@ package com.example.sender;
 import io.questdb.client.Sender;
 import io.questdb.client.Sender.LineSenderBuilder;
 import io.questdb.client.SenderConnectionListener;
+import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
+import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
@@ -44,6 +46,10 @@ public class CsvParallelSender {
     private static final String DEFAULT_PROTOCOL = "qwp";
     private static final String DEFAULT_SENDER_ID = "ha_sender";
     private static final String DEFAULT_STORE_FORWARD_DIR = "/tmp/qdb-sf";
+    // Upper bound (ms) on a single TCP connect attempt, so a black-holed host fails over fast
+    // instead of riding the OS connect timeout. 0 disables (falls back to the OS default).
+    // QWP + probe only; the ILP path is left untouched so --protocol ilp stays identical.
+    private static final int DEFAULT_CONNECT_TIMEOUT_MS = 3000;
     // Batch = one auto-flush append (deferred, no commit under transactional mode).
     // Transaction = batches-per-transaction batches, committed atomically per table
     // by an explicit flush(). See buildSender()/runWorker().
@@ -52,6 +58,11 @@ public class CsvParallelSender {
     // Probe (QWP only): poll the latest ingested timestamp on an interval, 0 disables.
     private static final long DEFAULT_PROBE_INTERVAL_MS = 1000L;
     private static final String PROBE_QUERY = "select timestamp from trades limit -1";
+    // Enterprise lifecycle status of whichever node the query client is currently connected to.
+    // Returns the LIVE role (columns like current_role / target_role), unlike the QWP handshake
+    // SERVER_INFO which is only refreshed on a reconnect and so goes stale after an in-place
+    // primary<->replica switch. The probe runs this each poll to report the true serving role.
+    private static final String STATUS_QUERY = "switch status";
     // Zone for the query client (egress). Biases failover toward same-zone instances on
     // Enterprise; a no-op on OSS (which advertises no zone). Empty omits the key.
     private static final String DEFAULT_ZONE = "eu-west-1";
@@ -88,13 +99,32 @@ public class CsvParallelSender {
         // support it and the connection is rejected, so it is off by default.
         final boolean enterprise = Boolean.parseBoolean(a.getOrDefault("--enterprise", "false"));
         final String zone = a.getOrDefault("--zone", DEFAULT_ZONE);
+        // QWP + probe: bound a single TCP connect attempt (0 disables). ILP is left unchanged.
+        final int connectTimeoutMs = Integer.parseInt(a.getOrDefault("--connect-timeout-ms",
+                String.valueOf(DEFAULT_CONNECT_TIMEOUT_MS)));
 
-        if (!protocol.equals("qwp") && !protocol.equals("ilp")) {
-            System.err.println("--protocol must be 'qwp' or 'ilp', got: " + protocol);
+        if (!protocol.equals("qwp") && !protocol.equals("ilp") && !protocol.equals("qwpudp")) {
+            System.err.println("--protocol must be 'qwp', 'qwpudp', or 'ilp', got: " + protocol);
             System.exit(2);
+        }
+        // QWP/UDP is fire-and-forget datagram ingest: the transport rejects authentication
+        // (the server accepts any connection on the UDP port), so any credentials passed are
+        // meaningless. Warn rather than fail, so the same command line works across transports.
+        if (protocol.equals("qwpudp")) {
+            final boolean hasAnyAuth = (token != null && !token.isEmpty())
+                    || (username != null && !username.isEmpty())
+                    || (password != null && !password.isEmpty());
+            if (hasAnyAuth) {
+                System.err.println("[warn] --protocol qwpudp is unauthenticated (UDP accepts any connection);"
+                        + " ignoring --token/--username/--password");
+            }
         }
         if (probeIntervalMs < 0) {
             System.err.println("--probe-interval-ms must be >= 0 (0 disables the probe)");
+            System.exit(2);
+        }
+        if (connectTimeoutMs < 0) {
+            System.err.println("--connect-timeout-ms must be >= 0 (0 uses the OS connect timeout)");
             System.exit(2);
         }
         if (batchSize <= 0) {
@@ -120,14 +150,19 @@ public class CsvParallelSender {
         }
 
         final SenderCfg cfg = new SenderCfg(protocol, addrsCsv, token, username, password, retryTimeout,
-                senderIdBase, storeForwardDir, batchSize, batchesPerTransaction, numSenders, enterprise, zone);
+                senderIdBase, storeForwardDir, batchSize, batchesPerTransaction, numSenders, enterprise, zone,
+                connectTimeoutMs);
 
         final String conf = buildConf(addrsCsv, token, username, password, retryTimeout);
         System.out.println("Ingestion started. Protocol: " + protocol
                 + (protocol.equals("qwp")
                         ? " (WebSocket, sender-id=" + senderIdBase + ", store-and-forward=" + storeForwardDir
-                                + ", batch-size=" + batchSize + ", batches-per-transaction=" + batchesPerTransaction + ")"
-                        : "")
+                                + ", batch-size=" + batchSize + ", batches-per-transaction=" + batchesPerTransaction
+                                + ", connect-timeout-ms=" + connectTimeoutMs + ", retry-timeout-ms=" + retryTimeout + ")"
+                        : protocol.equals("qwpudp")
+                                ? " (QWP/UDP datagrams, ingest-only, unauthenticated, no store-and-forward,"
+                                        + " no failover; query client disabled, batch-size=" + batchSize + ")"
+                                : "")
                 + " | config: " + conf.replaceAll("(token=)([^;]+)", "$1***")
                 .replaceAll("(password=)([^;]+)", "$1***"));
 
@@ -162,8 +197,10 @@ public class CsvParallelSender {
         reporter.setDaemon(true);
         reporter.start();
 
-        // Probe (QWP only): a separate thread polls the latest ingested timestamp over a
-        // QWP query client. Same hosts/auth as the senders; it fails over automatically.
+        // Probe (QWP/WebSocket only): a separate thread polls the latest ingested timestamp
+        // over a QWP query client. Same hosts/auth as the senders; it fails over automatically.
+        // Skipped for ilp and for qwpudp: UDP is ingest-only (there is no query path), so the
+        // equals("qwp") guard deliberately excludes it.
         final Thread probe = (protocol.equals("qwp") && probeIntervalMs > 0)
                 ? startProbe(cfg, probeIntervalMs)
                 : null;
@@ -181,7 +218,7 @@ public class CsvParallelSender {
             try {
                 f.get();
             } catch (ExecutionException ee) {
-                System.err.println("Worker failed: " + ee.getCause());
+                System.err.println("Worker failed: " + ee.getCause() + upgradeHint(ee.getCause()));
                 System.exit(1);
             }
         }
@@ -207,26 +244,35 @@ public class CsvParallelSender {
         System.out.printf("Sender %d will send %d events%n", senderId, totalEvents);
         long sent = 0;
         final boolean isQwp = cfg.protocol.equals("qwp");
-        // QWP with a single worker: stamp each row with the current time client-side. A single
-        // thread's timestamps are monotonic (no O3) and this avoids QWP's per-batch atNow()
-        // stamping. ILP, or QWP with more than one worker, use atNow() (server-side, O3-safe).
-        final boolean perRowMicros = isQwp && cfg.numSenders == 1;
-        // QWP transactional commit cadence: commit every batchSize * batchesPerTransaction
-        // rows via an explicit flush(). 0 disables periodic commits (ILP path is unchanged).
+        final boolean isUdp = cfg.protocol.equals("qwpudp");
+        // Single worker on a QWP transport (WebSocket or UDP): stamp each row with the current
+        // time client-side. A single thread's timestamps are monotonic (no O3) and this avoids
+        // QWP's per-batch atNow() stamping. ILP, or more than one worker, use atNow()
+        // (server-side, O3-safe).
+        final boolean perRowMicros = (isQwp || isUdp) && cfg.numSenders == 1;
+        // Flush cadence, by transport:
+        //   qwp    - transactional commit every batchSize * batchesPerTransaction rows (flush commits).
+        //   qwpudp - no transactions; flush every batchSize rows to emit datagrams (bounds the buffer).
+        //   ilp    - 0: no explicit mid-loop flush (the HTTP client auto-flushes).
         final long commitEveryRows = isQwp
                 ? (long) cfg.batchSize * cfg.batchesPerTransaction
-                : 0L;
+                : isUdp
+                        ? cfg.batchSize
+                        : 0L;
         try ( Sender sender = buildSender(cfg, senderId)) { //( Sender sender = Sender.fromConfig(conf)) {
             final int n = rows.size();
             for (long i = 0; i < totalEvents; i++) {
                 TradeRow r = rows.get((int) (i % n));
 
-                // Build row
+                // Build row. trade_id = <worker>-<1-based sequence>, monotonic per sender, so you
+                // can check completeness/gaps independent of timestamps and (with dedup) get
+                // idempotent replay. It is a high-cardinality VARCHAR, deliberately NOT a symbol.
                 sender.table("trades")
                         .symbol("symbol", r.symbol)
                         .symbol("side", r.side)
                         .doubleColumn("price", r.price)
-                        .doubleColumn("amount", r.amount);
+                        .doubleColumn("amount", r.amount)
+                        .stringColumn("trade_id", senderId + "-" + (i + 1));
 
                 if (timestampFromFile) {
                     Instant ts = Instant.parse(r.timestamp);
@@ -263,7 +309,7 @@ public class CsvParallelSender {
             sender.flush();
             System.out.printf("Sender %d finished sending %d events%n", senderId, sent);
         } catch (Exception e) {
-            System.err.printf("Sender %d got error: %s%n", senderId, e.toString());
+            System.err.printf("Sender %d got error: %s%s%n", senderId, e.toString(), upgradeHint(e));
             throw new RuntimeException(e);
         }
     }
@@ -362,6 +408,24 @@ public class CsvParallelSender {
             return buildBuilder(cfg.addrsCsv, cfg.token, cfg.username, cfg.password, cfg.retryTimeout).build();
         }
 
+        if ("qwpudp".equals(cfg.protocol)) {
+            // ---- QWP/UDP branch ----
+            // Fire-and-forget datagrams to the UDP ingest port (:9007 by convention). The
+            // transport rejects authentication and does not use TLS, store-and-forward,
+            // failover, or a connection listener (there is no persistent connection). Any
+            // token/basic auth on the command line was already warned about and is ignored.
+            String[] udpAddrs = Arrays.stream(cfg.addrsCsv.split(","))
+                    .map(String::trim)
+                    .filter(s -> !s.isEmpty())
+                    .toArray(String[]::new);
+
+            LineSenderBuilder u = Sender.builder(Sender.Transport.UDP);
+            for (String addr : udpAddrs) {
+                u.address(addr);
+            }
+            return u.build();
+        }
+
         // ---- QWP (WebSocket) branch ----
         String[] addrs = Arrays.stream(cfg.addrsCsv.split(","))
                 .map(String::trim)
@@ -422,15 +486,16 @@ public class CsvParallelSender {
                 case AUTH_FAILED:
                     msg = "auth failed for " + host;
                     break;
-                case RECONNECT_BUDGET_EXHAUSTED:
-                    msg = "reconnect budget exhausted, giving up";
-                    break;
+                // NOTE: no RECONNECT_BUDGET_EXHAUSTED case on purpose. That kind was dropped from
+                // the client's SenderConnectionEvent.Kind in newer builds (e.g. 1.3.6-SNAPSHOT), so
+                // switching on it fails to compile there. If a client still emits it, the default
+                // branch below narrates it generically.
                 case DISCONNECTED:
                     msg = "connection lost to " + host + " (" + cause + "), will retry";
                     noisy = true;
                     break;
                 case ENDPOINT_ATTEMPT_FAILED:
-                    msg = "endpoint " + host + " failed (" + cause + "), trying next";
+                    msg = "endpoint " + host + " failed (" + cause + "), trying next" + upgradeHint(event.getCause());
                     noisy = true;
                     break;
                 case ALL_ENDPOINTS_UNREACHABLE:
@@ -457,11 +522,18 @@ public class CsvParallelSender {
             b.requestDurableAck(true);
         }
 
+        // Bound a single TCP connect so a black-holed host fails over fast (0 = OS default).
+        if (cfg.connectTimeoutMs > 0) {
+            b.connectTimeoutMillis(cfg.connectTimeoutMs);
+        }
+
         return b.storeAndForwardDir(sfPath)
                 .senderId(who)
                 .transactional(true)
                 .connectionListener(connListener)
-                .reconnectMaxDurationMillis(300_000)
+                // reconnectMaxDurationMillis is the QWP analog of the ILP retryTimeoutMillis:
+                // the overall "keep retrying" budget. Driven by --retry-timeout on both transports.
+                .reconnectMaxDurationMillis(cfg.retryTimeout)
                 .reconnectInitialBackoffMillis(100)
                 .reconnectMaxBackoffMillis(5_000)
                 .autoFlushBytes(524_288)              // 512 KiB, under the ~1MB WS frame cap
@@ -494,6 +566,10 @@ public class CsvParallelSender {
         }
         if (tls) {
             sb.append("tls_verify=unsafe_off;");
+        }
+        // Bound the probe's TCP connect too, so it fails over as fast as the senders (0 = OS default).
+        if (cfg.connectTimeoutMs > 0) {
+            sb.append("connect_timeout=").append(cfg.connectTimeoutMs).append(';');
         }
         if (addrs.length > 1) {
             sb.append("failover=on;");
@@ -546,8 +622,71 @@ public class CsvParallelSender {
                                 orNone(info.getNodeId()), QwpServerInfo.roleName(info.getRole()), orNone(info.getZoneId()));
                     }
                 };
+                // `switch status` reports the serving node's LIVE lifecycle role: current_role, plus
+                // target_role while a switch is in flight. This is authoritative -- unlike the QWP
+                // handshake role from getServerInfo(), it reflects an in-place promotion/demotion that
+                // never dropped the read connection. We show current_role as THE role; getServerInfo()
+                // only supplies node/zone, and its handshake role is a labelled fallback used solely
+                // when the status query is unavailable (e.g. missing SYSTEM ADMIN). statusDiag says why.
+                final String[] currentRole = {null};
+                final String[] targetRole = {null};
+                final String[] statusDiag = {null};
+                final long[] lastStatusDiagMs = {0L};
+                final QwpColumnBatchHandler statusHandler = new QwpColumnBatchHandler() {
+                    @Override
+                    public void onBatch(QwpColumnBatch batch) {
+                        final int cols = batch.getColumnCount();
+                        final StringBuilder names = new StringBuilder();
+                        for (int c = 0; c < cols; c++) {
+                            if (names.length() > 0) {
+                                names.append(',');
+                            }
+                            names.append(batch.getColumnName(c));
+                        }
+                        batch.forEachRow(row -> {
+                            for (int c = 0; c < cols; c++) {
+                                final String name = batch.getColumnName(c);
+                                if (name == null) {
+                                    continue;
+                                }
+                                final String lower = name.toLowerCase(java.util.Locale.ROOT);
+                                if (!lower.contains("role")) {
+                                    continue;
+                                }
+                                final String value = row.isNull(c) ? null : row.getString(c);
+                                if (lower.contains("current")) {
+                                    currentRole[0] = value;
+                                } else if (lower.contains("target")) {
+                                    targetRole[0] = value;
+                                } else if (currentRole[0] == null) {
+                                    // A single unqualified "role" column (older servers) is the current one.
+                                    currentRole[0] = value;
+                                }
+                            }
+                        });
+                        if (currentRole[0] == null) {
+                            statusDiag[0] = "'" + STATUS_QUERY + "' returned no current-role column; columns=[" + names + "]";
+                        }
+                    }
+
+                    @Override
+                    public void onEnd(long totalRows) {
+                    }
+
+                    @Override
+                    public void onError(byte status, String message) {
+                        statusDiag[0] = "'" + STATUS_QUERY + "' error (status " + status + "): " + message;
+                    }
+
+                    @Override
+                    public void onFailoverReset(QwpServerInfo info) {
+                    }
+                };
                 while (!Thread.currentThread().isInterrupted()) {
                     latest[0] = Long.MIN_VALUE;
+                    currentRole[0] = null;
+                    targetRole[0] = null;
+                    statusDiag[0] = null;
                     try {
                         client.execute(PROBE_QUERY, handler);
                         if (wasDown[0]) {
@@ -557,13 +696,45 @@ public class CsvParallelSender {
                         if (latest[0] != Long.MIN_VALUE) {
                             // trades designated timestamp is microseconds by default.
                             Instant ts = Instant.EPOCH.plus(latest[0], ChronoUnit.MICROS);
+                            // Ask the serving node for its live role. A status-query failure must not
+                            // look like a connection loss, so swallow it here (currentRole stays null).
+                            try {
+                                client.execute(STATUS_QUERY, statusHandler);
+                            } catch (Exception ex) {
+                                statusDiag[0] = "'" + STATUS_QUERY + "' threw: " + ex;
+                            }
+                            if (currentRole[0] == null && statusDiag[0] == null) {
+                                statusDiag[0] = "'" + STATUS_QUERY + "' produced no row batch and no error"
+                                        + " (not a SELECT-style result on the read path?)";
+                            }
+                            // Role comes from `switch status` (the authoritative live role of the serving
+                            // node). getServerInfo() only supplies node/zone here; its handshake role is a
+                            // labelled fallback used only when the status query is unavailable.
                             final QwpServerInfo si = client.getServerInfo();
-                            final String served = si != null
-                                    ? " served by role=" + QwpServerInfo.roleName(si.getRole())
-                                            + " node=" + orNone(si.getNodeId()) + " zone=" + orNone(si.getZoneId())
-                                    : "";
+                            final String node = si != null ? orNone(si.getNodeId()) : "(none)";
+                            final String zone = si != null ? orNone(si.getZoneId()) : "(none)";
+                            final String served;
+                            if (currentRole[0] != null) {
+                                final boolean switching = targetRole[0] != null
+                                        && !targetRole[0].equalsIgnoreCase(currentRole[0]);
+                                served = " served by role=" + currentRole[0]
+                                        + (switching ? " (switching -> " + targetRole[0] + ")" : "")
+                                        + " node=" + node + " zone=" + zone;
+                            } else {
+                                final String handshake = si != null ? QwpServerInfo.roleName(si.getRole()) : "unknown";
+                                served = " served by role=" + handshake + " node=" + node + " zone=" + zone
+                                        + " (handshake role; live 'switch status' unavailable, may be stale)";
+                            }
                             System.out.printf("[probe] latest trades timestamp = %s (raw=%d)%s%n",
                                     ts, latest[0], served);
+                            // Explain a missing live role at most once per 30s so it does not spam.
+                            if (currentRole[0] == null && statusDiag[0] != null) {
+                                final long now = System.currentTimeMillis();
+                                if (now - lastStatusDiagMs[0] > 30_000L) {
+                                    lastStatusDiagMs[0] = now;
+                                    System.out.println("[probe] live role unavailable: " + statusDiag[0]);
+                                }
+                            }
                         }
                     } catch (Exception e) {
                         if (!wasDown[0]) {
@@ -577,7 +748,7 @@ public class CsvParallelSender {
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
             } catch (Exception e) {
-                System.err.println("[probe] stopped: " + e.getMessage());
+                System.err.println("[probe] stopped: " + e.getMessage() + upgradeHint(e));
             }
         }, "qwp-probe");
         t.setDaemon(true);
@@ -587,6 +758,36 @@ public class CsvParallelSender {
 
     private static String orNone(String s) {
         return (s == null || s.isEmpty()) ? "(none)" : s;
+    }
+
+    // Turn a failed QWP WebSocket-upgrade throwable into a human-readable hint, using the
+    // client's TYPED signals rather than string-matching the message:
+    //   - QwpAuthFailedException  -> a definitive auth rejection (HTTP 401/403).
+    //   - WebSocketUpgradeException.isRoleMismatch() (HTTP 421) -> the endpoint is not writable
+    //     (a REPLICA / PRIMARY_CATCHUP), i.e. no primary is available among --addrs to accept writes.
+    //   - WebSocketUpgradeException with status 400 -> a missing/malformed auth token (e.g. an
+    //     unset token env var): the server refuses the upgrade before it can return a 401.
+    // Walks the cause chain (the upgrade failure is usually wrapped). Returns "" otherwise.
+    private static String upgradeHint(Throwable t) {
+        for (Throwable c = t; c != null; c = c.getCause()) {
+            if (c instanceof QwpAuthFailedException) {
+                final QwpAuthFailedException a = (QwpAuthFailedException) c;
+                return " -- auth rejected (HTTP " + a.getStatusCode() + "): bad/expired credentials"
+                        + " or missing permission; check --token or --user/--password";
+            }
+            if (c instanceof WebSocketUpgradeException) {
+                final WebSocketUpgradeException w = (WebSocketUpgradeException) c;
+                if (w.isRoleMismatch()) {
+                    return " -- endpoint is not writable (role=" + w.getServerRole() + "): no primary"
+                            + " available among --addrs to accept writes";
+                }
+                if (w.getStatusCode() == 400) {
+                    return " -- HTTP 400 on the upgrade: likely a missing or malformed ILP auth token"
+                            + " (e.g. an unset token env var); check --token or --user/--password";
+                }
+            }
+        }
+        return "";
     }
 
     private static String buildConf(String addrsCsv, String token, String username, String password, int retryTimeout) {
@@ -644,6 +845,7 @@ public class CsvParallelSender {
                 case "--batch-size":
                 case "--batches-per-transaction":
                 case "--probe-interval-ms":
+                case "--connect-timeout-ms":
                 case "--enterprise":
                 case "--zone":
                     if (i + 1 >= args.length) {
@@ -682,10 +884,12 @@ public class CsvParallelSender {
         final int numSenders;
         final boolean enterprise;
         final String zone;
+        final int connectTimeoutMs;
 
         SenderCfg(String protocol, String addrsCsv, String token, String username, String password,
                   int retryTimeout, String senderIdBase, String storeForwardDir,
-                  int batchSize, int batchesPerTransaction, int numSenders, boolean enterprise, String zone) {
+                  int batchSize, int batchesPerTransaction, int numSenders, boolean enterprise, String zone,
+                  int connectTimeoutMs) {
             this.protocol = protocol;
             this.addrsCsv = addrsCsv;
             this.token = token;
@@ -699,6 +903,7 @@ public class CsvParallelSender {
             this.numSenders = numSenders;
             this.enterprise = enterprise;
             this.zone = zone;
+            this.connectTimeoutMs = connectTimeoutMs;
         }
     }
 }
