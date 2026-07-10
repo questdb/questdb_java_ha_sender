@@ -103,9 +103,21 @@ public class CsvParallelSender {
         final int connectTimeoutMs = Integer.parseInt(a.getOrDefault("--connect-timeout-ms",
                 String.valueOf(DEFAULT_CONNECT_TIMEOUT_MS)));
 
-        if (!protocol.equals("qwp") && !protocol.equals("ilp")) {
-            System.err.println("--protocol must be 'qwp' or 'ilp', got: " + protocol);
+        if (!protocol.equals("qwp") && !protocol.equals("ilp") && !protocol.equals("qwpudp")) {
+            System.err.println("--protocol must be 'qwp', 'qwpudp', or 'ilp', got: " + protocol);
             System.exit(2);
+        }
+        // QWP/UDP is fire-and-forget datagram ingest: the transport rejects authentication
+        // (the server accepts any connection on the UDP port), so any credentials passed are
+        // meaningless. Warn rather than fail, so the same command line works across transports.
+        if (protocol.equals("qwpudp")) {
+            final boolean hasAnyAuth = (token != null && !token.isEmpty())
+                    || (username != null && !username.isEmpty())
+                    || (password != null && !password.isEmpty());
+            if (hasAnyAuth) {
+                System.err.println("[warn] --protocol qwpudp is unauthenticated (UDP accepts any connection);"
+                        + " ignoring --token/--username/--password");
+            }
         }
         if (probeIntervalMs < 0) {
             System.err.println("--probe-interval-ms must be >= 0 (0 disables the probe)");
@@ -147,7 +159,10 @@ public class CsvParallelSender {
                         ? " (WebSocket, sender-id=" + senderIdBase + ", store-and-forward=" + storeForwardDir
                                 + ", batch-size=" + batchSize + ", batches-per-transaction=" + batchesPerTransaction
                                 + ", connect-timeout-ms=" + connectTimeoutMs + ", retry-timeout-ms=" + retryTimeout + ")"
-                        : "")
+                        : protocol.equals("qwpudp")
+                                ? " (QWP/UDP datagrams, ingest-only, unauthenticated, no store-and-forward,"
+                                        + " no failover; query client disabled, batch-size=" + batchSize + ")"
+                                : "")
                 + " | config: " + conf.replaceAll("(token=)([^;]+)", "$1***")
                 .replaceAll("(password=)([^;]+)", "$1***"));
 
@@ -182,8 +197,10 @@ public class CsvParallelSender {
         reporter.setDaemon(true);
         reporter.start();
 
-        // Probe (QWP only): a separate thread polls the latest ingested timestamp over a
-        // QWP query client. Same hosts/auth as the senders; it fails over automatically.
+        // Probe (QWP/WebSocket only): a separate thread polls the latest ingested timestamp
+        // over a QWP query client. Same hosts/auth as the senders; it fails over automatically.
+        // Skipped for ilp and for qwpudp: UDP is ingest-only (there is no query path), so the
+        // equals("qwp") guard deliberately excludes it.
         final Thread probe = (protocol.equals("qwp") && probeIntervalMs > 0)
                 ? startProbe(cfg, probeIntervalMs)
                 : null;
@@ -227,15 +244,21 @@ public class CsvParallelSender {
         System.out.printf("Sender %d will send %d events%n", senderId, totalEvents);
         long sent = 0;
         final boolean isQwp = cfg.protocol.equals("qwp");
-        // QWP with a single worker: stamp each row with the current time client-side. A single
-        // thread's timestamps are monotonic (no O3) and this avoids QWP's per-batch atNow()
-        // stamping. ILP, or QWP with more than one worker, use atNow() (server-side, O3-safe).
-        final boolean perRowMicros = isQwp && cfg.numSenders == 1;
-        // QWP transactional commit cadence: commit every batchSize * batchesPerTransaction
-        // rows via an explicit flush(). 0 disables periodic commits (ILP path is unchanged).
+        final boolean isUdp = cfg.protocol.equals("qwpudp");
+        // Single worker on a QWP transport (WebSocket or UDP): stamp each row with the current
+        // time client-side. A single thread's timestamps are monotonic (no O3) and this avoids
+        // QWP's per-batch atNow() stamping. ILP, or more than one worker, use atNow()
+        // (server-side, O3-safe).
+        final boolean perRowMicros = (isQwp || isUdp) && cfg.numSenders == 1;
+        // Flush cadence, by transport:
+        //   qwp    - transactional commit every batchSize * batchesPerTransaction rows (flush commits).
+        //   qwpudp - no transactions; flush every batchSize rows to emit datagrams (bounds the buffer).
+        //   ilp    - 0: no explicit mid-loop flush (the HTTP client auto-flushes).
         final long commitEveryRows = isQwp
                 ? (long) cfg.batchSize * cfg.batchesPerTransaction
-                : 0L;
+                : isUdp
+                        ? cfg.batchSize
+                        : 0L;
         try ( Sender sender = buildSender(cfg, senderId)) { //( Sender sender = Sender.fromConfig(conf)) {
             final int n = rows.size();
             for (long i = 0; i < totalEvents; i++) {
@@ -383,6 +406,24 @@ public class CsvParallelSender {
     private static Sender buildSender(SenderCfg cfg, int workerId) {
         if ("ilp".equals(cfg.protocol)) {
             return buildBuilder(cfg.addrsCsv, cfg.token, cfg.username, cfg.password, cfg.retryTimeout).build();
+        }
+
+        if ("qwpudp".equals(cfg.protocol)) {
+            // ---- QWP/UDP branch ----
+            // Fire-and-forget datagrams to the UDP ingest port (:9007 by convention). The
+            // transport rejects authentication and does not use TLS, store-and-forward,
+            // failover, or a connection listener (there is no persistent connection). Any
+            // token/basic auth on the command line was already warned about and is ignored.
+            String[] udpAddrs = Arrays.stream(cfg.addrsCsv.split(","))
+                    .map(String::trim)
+                    .filter(s -> !s.isEmpty())
+                    .toArray(String[]::new);
+
+            LineSenderBuilder u = Sender.builder(Sender.Transport.UDP);
+            for (String addr : udpAddrs) {
+                u.address(addr);
+            }
+            return u.build();
         }
 
         // ---- QWP (WebSocket) branch ----

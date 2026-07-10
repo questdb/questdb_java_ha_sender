@@ -51,10 +51,15 @@ connect attempt.
 - `--protocol qwp` (default): QWP over WebSocket. Adds store-and-forward (un-acked
   frames spill to disk and replay after an outage) and transactional commit. Use the
   server's **HTTP port** (`:9000`) in `--addrs`.
-- `--protocol ilp`: the previous HTTP/ILP transport, unchanged. Ignores the QWP-only
-  flags below.
+- `--protocol qwpudp`: QWP over **UDP**, fire-and-forget datagram ingest. Use the
+  server's **UDP ingest port** (`:9007` by convention) in `--addrs`. It is **ingest-only,
+  unauthenticated, best-effort, and single-endpoint** (no failover). See
+  [QWP/UDP transport](#qwpudp-transport-best-effort-single-endpoint) for the full picture
+  and how to avoid packet loss.
+- `--protocol ilp`: the previous HTTP/ILP transport, unchanged. Ignores the
+  QWP/WebSocket-only flags below.
 
-QWP-only flags:
+QWP/WebSocket-only flags (`qwp`; ignored by `qwpudp` and `ilp`):
 
 - `--sender-id` (default `ha_sender`): store-and-forward key. **Must be unique per
   process/server**; set it explicitly when running more than one process on a host.
@@ -76,7 +81,7 @@ QWP-only flags:
   OS connect timeout (~minutes) before failing over to the next `--addrs` host; with it, failover
   happens in seconds. The ILP path is left unbounded so `--protocol ilp` stays identical.
 - `--probe-interval-ms` (default `1000`, `0` disables): interval for the probe thread
-  that polls the latest ingested timestamp. See [Probe](#probe-qwp-only) below.
+  that polls the latest ingested timestamp. See [Probe](#probe-qwpwebsocket-only) below.
 - `--enterprise` (default `false`): request durable acks (`requestDurableAck`), holding
   spilled frames until the server confirms a durable commit. **Enterprise only**: an OSS
   server rejects the WebSocket upgrade, so leave it off against OSS. See
@@ -85,6 +90,51 @@ QWP-only flags:
   to its connect string as `zone=`. Biases failover toward same-zone instances on
   Enterprise; a no-op on OSS. The ingestion path is zone-blind (it must follow the
   primary), so this does not affect the senders.
+
+## QWP/UDP transport (best-effort, single endpoint)
+
+`--protocol qwpudp` sends rows as UDP datagrams to the server's UDP ingest port (`:9007`
+by convention; put it in `--addrs`). The server must have UDP ingest enabled, and it
+accepts **any** connection on that port. It is the simplest and lowest-overhead
+transport, at the cost of every reliability guarantee the other two provide.
+
+**Ingest-only, unauthenticated.** There is no query path, so the probe is not started and
+`--probe-interval-ms` is ignored. UDP rejects authentication: `--token`, `--username`, and
+`--password` are ignored (with a warning). Store-and-forward, TLS, and durable ack do not
+apply.
+
+**Single endpoint, no failover.** UDP is connectionless and unacknowledged: there is no
+connection to detect as dropped and no delivery feedback, so the client cannot know a host
+is down and therefore **cannot fail over**. The client enforces this by rejecting more than
+one address:
+
+```
+only a single address (host:port) is supported for UDP transport
+```
+
+Pass exactly one `host:9007`. If that host is down, datagrams are silently lost. For high
+availability across hosts use `qwp` (WebSocket store-and-forward) or `ilp` (HTTP retry).
+
+**Best-effort: datagrams can be dropped.** There is no ack, no retransmit, and no
+store-and-forward, so a lost datagram is a lost row. UDP also has **no backpressure**: if
+the sender emits datagrams faster than the server drains its OS receive buffer, the buffer
+overflows and datagrams are dropped **wholesale**, not one at a time.
+
+That burst sensitivity is the main thing to tune. Rows are flushed to datagrams every
+`--batch-size` rows, so a large batch flushed all at once (especially by several workers
+finishing together) is exactly the burst that overflows the buffer. Observed on loopback:
+
+| Config | Result |
+| --- | --- |
+| `--num-senders 4 --batch-size 10000` (one big burst per worker) | **0 of 8000 rows landed** |
+| `--num-senders 4 --batch-size 100` (paced, small flushes) | **8000 of 8000 rows landed** |
+
+So for UDP, **keep `--batch-size` small** (e.g. `100`-`500`) to pace the datagrams, and if
+you still see loss, raise the OS UDP receive-buffer size on the server host
+(`net.core.rmem_max` / `rmem_default` on Linux). Even then, treat UDP as best-effort:
+enable dedup and reconcile counts if you need to know what landed. Timestamp behavior is
+the same as the other transports (a single worker stamps client-side micros; multiple
+workers use server-side `atNow()`; see [Timestamps](#timestamps-and-throughput)).
 
 ## Commit cadence (freshness vs throughput)
 
@@ -113,9 +163,9 @@ seconds between commits (per worker) = (batch-size × batches-per-transaction) /
   for many seconds. Keep `--batches-per-transaction` small when freshness matters more
   than raw throughput.
 
-## Probe (QWP only)
+## Probe (QWP/WebSocket only)
 
-When the transport is QWP, a separate thread polls the latest ingested timestamp and
+When the transport is `qwp` (WebSocket), a separate thread polls the latest ingested timestamp and
 prints it to stdout once per `--probe-interval-ms` (default `1000` ms; `0` disables). It
 runs `select timestamp from trades limit -1` over a **QWP query client** and is fully
 independent of the senders, so it does not affect ingestion.
@@ -140,8 +190,8 @@ The query client uses the **same host list and token/auth** as the senders and e
 if a host stops responding it moves to the next one automatically and narrates the
 transition (see [Failover and connection narration](#failover-and-connection-narration-qwp)).
 Before the `trades` table exists it prints `[query client] server error: table does not
-exist` each interval, then switches to timestamps once ingestion begins. ILP ignores
-`--probe-interval-ms`.
+exist` each interval, then switches to timestamps once ingestion begins. `ilp` and
+`qwpudp` ignore `--probe-interval-ms` (neither has a query path).
 
 On connect the probe prints the instance actually serving it:
 
