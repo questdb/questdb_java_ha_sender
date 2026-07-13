@@ -1,5 +1,21 @@
 # Sample Sender with Multiple Hosts for HA Ingestion
 
+## Client implementations
+
+This project is a QuestDB high-availability sender. The **Java** implementation in this
+repository is the **reference**. It is ported, in parity, to the three clients built on the
+same C/Rust core (the "CRusty" clients):
+
+- [`rust/`](./rust) - Rust port.
+- [`python/`](./python) - Python port, plus a pandas/polars ingestion and egress demo.
+- [`c/`](./c) - C/C++ port.
+
+Each mirrors the Java design (CSV replay loop, per-worker senders, the `qwp` / `qwpudp` /
+`ilp` transports, failover, store-and-forward, and the probe). Per-language build steps and
+client differences (for example, auto-flush is present in Java and Python but not in Rust or
+C/C++) are documented in that folder's `README.md`. The rest of this document describes the
+reference Java implementation.
+
 ## Compile
 
 `mvn  -DskipTests clean package`
