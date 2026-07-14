@@ -62,6 +62,98 @@ java -jar target/ilp_sender-1.0-SNAPSHOT.jar \
 QWP. That is a different timeout from `--connect-timeout-ms` (below), which bounds a single
 connect attempt.
 
+## Pacing: `--delay-ms` vs `--rate`
+
+Two mutually exclusive ways to throttle generation:
+
+- `--delay-ms` (default `50`): a fixed `Thread.sleep(delay)` after **every row**, per worker.
+  Simple, but a poor throttle at speed: `sleep()` has millisecond granularity (and often
+  over-sleeps), and the fixed per-row cost caps throughput. `--delay-ms 1` yields well under
+  1000 rows/s; `--delay-ms 0` runs flat out (millions/s).
+- `--rate` (default `0` = off): a **target aggregate rate in rows/second across all workers**.
+  Each worker paces itself to its share (`rate / num-senders`) against a deadline schedule,
+  sending rows back-to-back and sleeping only when it runs *ahead* of schedule (coalescing many
+  rows into one sleep). This hits high targets a per-row delay never could: `--rate 300000`
+  holds ~300k rows/s regardless of `--num-senders`.
+
+When `--rate > 0` it **takes precedence** and `--delay-ms` is ignored (a warning is printed if
+both are set). Measured on a local QuestDB: `--rate 5000` → 4.03 s for 20k rows (~4966/s);
+`--rate 300000` → 2.03 s for 600k rows (~296k/s), steady per-second progress at the target.
+
+### Regenerating the replay CSV
+
+Two scripts regenerate the replay CSV. **Both always export from the public demo box**
+(`https://demo.questdb.io/exp`) on purpose: the demo is *continuously ingesting live market
+data*, so every export is a fresh, recent-price snapshot rather than a stale file. You then
+**recreate the table locally** from that CSV and replay it for internal demos. The sender
+always writes into a table named **`trades`** locally, regardless of which demo table the CSV
+came from.
+
+- **`regenerate_csv.sh`** — pulls the crypto **`trades`** table (BTC-USDT, ...). Its
+  timestamp is microseconds.
+  ```
+  ./regenerate_csv.sh                   # -> trades.csv, 1,000,000 most-recent rows
+  ./regenerate_csv.sh trades.csv.gz     # gzip output (matches the --csv default's .gz)
+  ./regenerate_csv.sh trades.csv 250000 # custom row count
+  ```
+- **`regenerate_csv_fx.sh`** — pulls the FX **`fx_trades`** table (EURCHF, AUDNZD, ...).
+  Two schema differences from the crypto table, both handled in the query
+  `select timestamp, symbol, side, price, quantity as amount from fx_trades order by timestamp desc limit N`:
+  its size column is **`quantity`**, aliased to **`amount`** so it matches the `trades` schema
+  the sender writes; and its designated timestamp is **`TIMESTAMP_NS`** (nanoseconds), not
+  micros (see [Nanosecond vs microsecond timestamps](#nanosecond-vs-microsecond-timestamps)).
+  ```
+  ./regenerate_csv_fx.sh                      # -> fx_trades.csv, 1,000,000 rows
+  ./regenerate_csv_fx.sh fx_trades.csv.gz     # gzipped
+  ./regenerate_csv_fx.sh fx_trades.csv 250000 # custom row count
+  ```
+
+Both export exactly `symbol, side, price, amount, timestamp` (the columns the sender reads),
+download to a temp file first so a failed fetch never clobbers a good CSV, and gzip-compress
+when the output path ends in `.gz` (the loader auto-detects `.gz`). Override `DEMO_HOST` only if
+you mirror the demo tables elsewhere.
+
+### Nanosecond vs microsecond timestamps
+
+The crypto `trades` table exports microsecond timestamps; the FX `fx_trades` table exports
+**nanosecond** timestamps (`TIMESTAMP_NS`, e.g. `...192508297Z`). This only ever matters with
+`--timestamp-from-file`; in the default replay mode the sender stamps `now()` and ignores the
+file timestamp entirely, so precision is irrelevant.
+
+**The generator sends timestamps at nanosecond resolution** (via `at(long, NANOS)`), and
+QuestDB stores them at the **target column's** resolution: a micros `TIMESTAMP` column silently
+truncates the extra digits, a `TIMESTAMP_NS` column keeps them. Cross-resolution replay is
+therefore safe in both directions and lands every row. Validated against a local QuestDB, 20k
+crypto + 20k FX rows each way (all 40k landing, no errors):
+
+| Local `trades` column | Replayed source | Stored as |
+| --- | --- | --- |
+| `timestamp` (micros) | crypto micros `...790999Z` | `...790999Z` |
+| `timestamp` (micros) | FX nanos `...192508297Z` | `...192508Z` (truncated to micros) |
+| `timestamp_ns` (nanos) | crypto micros `...790999Z` | `...790999000Z` |
+| `timestamp_ns` (nanos) | FX nanos `...192508297Z` | `...192508297Z` (**full nanos preserved**) |
+
+So if your local table is `TIMESTAMP_NS`, the FX source's nanosecond precision is preserved
+end-to-end; if it is micros, the sub-microsecond digits are truncated on store (lossless to the
+column's resolution, never an error). To recreate the local table at a given resolution,
+pre-create it before ingesting, e.g.:
+
+```sql
+-- microsecond trades table
+create table trades (symbol symbol, side symbol, price double, amount double,
+  trade_id varchar, timestamp timestamp) timestamp(timestamp) partition by day wal;
+
+-- nanosecond trades table (swap the timestamp type)
+create table trades (symbol symbol, side symbol, price double, amount double,
+  trade_id varchar, timestamp timestamp_ns) timestamp(timestamp) partition by day wal;
+```
+
+**If the table does not exist, the server auto-creates it as `TIMESTAMP_NS`** (nanosecond),
+because the generator sends nanosecond timestamps: the designated timestamp column is created
+at the resolution of the incoming value. Verified end-to-end: dropping `trades` and replaying
+the FX chunk with `--timestamp-from-file` recreated it with a `TIMESTAMP_NS` column holding the
+full `...192508297Z` value. Pre-create the table (above) if you want micros instead.
+
 ## Transport (`--protocol`)
 
 - `--protocol qwp` (default): QWP over WebSocket. Adds store-and-forward (un-acked

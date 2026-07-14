@@ -42,7 +42,12 @@ def parse_args(argv):
     p.add_argument("--username", default=None, help="Basic-auth username.")
     p.add_argument("--password", default=None, help="Basic-auth password.")
     p.add_argument("--total-events", type=int, default=1_000_000)
-    p.add_argument("--delay-ms", type=int, default=50)
+    p.add_argument("--delay-ms", type=int, default=50,
+                   help="Per-row sleep in ms (0 = flat out). Ignored when --rate > 0.")
+    p.add_argument("--rate", type=int, default=0,
+                   help="Target aggregate rows/second across ALL workers (0 = off, use "
+                        "--delay-ms). Takes precedence over --delay-ms: each worker paces to "
+                        "rate/num-senders against a deadline schedule.")
     p.add_argument("--num-senders", type=int, default=10)
     p.add_argument("--retry-timeout", type=int, default=360_000,
                    help="retry_timeout (ILP) / reconnect_max_duration_millis (QWP), in ms.")
@@ -131,6 +136,27 @@ def build_client_conf(args):
     return "".join(parts)
 
 
+def iso_to_nanos(raw):
+    """Parse an ISO-8601 timestamp to epoch nanoseconds, preserving full nanosecond
+    precision. datetime is microsecond-limited and would drop the last 3 digits of a
+    TIMESTAMP_NS value (e.g. ...192508297Z -> ...192508000), so the fractional seconds are
+    split out and parsed as an integer, and only the whole-second part goes through datetime."""
+    raw = raw.strip()
+    frac_nanos = 0
+    dot = raw.find(".")
+    if dot != -1:
+        end = dot + 1
+        while end < len(raw) and raw[end].isdigit():
+            end += 1
+        frac = raw[dot + 1:end]
+        frac_nanos = int(frac[:9].ljust(9, "0"))
+        raw = raw[:dot] + raw[end:]
+    dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp()) * 1_000_000_000 + frac_nanos
+
+
 def load_csv(path, need_timestamp):
     """Load the CSV (optionally gzipped). Returns a list of (symbol, side, price, amount,
     ts_nanos) tuples; ts_nanos is 0 unless need_timestamp."""
@@ -152,10 +178,7 @@ def load_csv(path, need_timestamp):
                 continue
             ts_nanos = 0
             if need_timestamp:
-                raw = rec[idx["timestamp"]].strip()
-                # ISO-8601, e.g. 2025-07-28T12:34:56.789012Z
-                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-                ts_nanos = int(dt.timestamp() * 1_000_000_000)
+                ts_nanos = iso_to_nanos(rec[idx["timestamp"]].strip())
             rows.append((
                 rec[idx["symbol"]].strip(),
                 rec[idx["side"]].strip(),
@@ -177,9 +200,17 @@ def run_worker(worker_id, total_events, args, rows, counts):
     # every batch-size rows (auto_flush is off, so the buffer is drained explicitly).
     commit_every = args.batch_size * args.batches_per_transaction if is_qwp else args.batch_size
 
+    # Rate limiting (when --rate > 0): pace this worker to its share of the aggregate target,
+    # rate / num-senders rows/second. interval_nanos is the ideal spacing between this worker's
+    # rows; we sleep only when running ahead of a deadline schedule, so rows go out back-to-back
+    # until we get ahead. Reaches high targets a fixed per-row sleep cannot.
+    interval_nanos = (1_000_000_000 * args.num_senders / args.rate) if args.rate > 0 else 0.0
+    rate_limited = interval_nanos > 0.0
+
     conf = build_ingest_conf(args, worker_id)
     n = len(rows)
     sent = 0
+    pace_start = time.perf_counter_ns()
     with Sender.from_conf(conf) as sender:
         for i in range(total_events):
             symbol, side, price, amount, ts_nanos = rows[i % n]
@@ -201,7 +232,14 @@ def run_worker(worker_id, total_events, args, rows, counts):
             counts[worker_id] = sent
             if sent % commit_every == 0:
                 sender.flush()
-            if args.delay_ms > 0:
+            if rate_limited:
+                # Deadline for the row just sent (sent is 1-based). Sleep only while ahead of
+                # schedule; the 1ms floor coalesces many rows into one sleep at high rates.
+                target_nanos = int(sent * interval_nanos)
+                sleep_nanos = target_nanos - (time.perf_counter_ns() - pace_start)
+                if sleep_nanos > 1_000_000:
+                    time.sleep(sleep_nanos / 1_000_000_000)
+            elif args.delay_ms > 0:
                 time.sleep(args.delay_ms / 1000.0)
         sender.flush()
         # QWP/WebSocket: drain any un-acked store-and-forward frames before closing.
@@ -292,6 +330,15 @@ def main(argv):
             print("[warn] --protocol qwpudp is unauthenticated (UDP accepts any connection); "
                   "ignoring --token/--username/--password", file=sys.stderr)
 
+    if args.rate < 0:
+        print("--rate must be >= 0 (0 disables rate limiting, falling back to --delay-ms)",
+              file=sys.stderr)
+        return 2
+    # --rate takes precedence: when set it drives pacing and --delay-ms is ignored.
+    if args.rate > 0 and args.delay_ms > 0:
+        print(f"[warn] --rate {args.rate} overrides --delay-ms {args.delay_ms} (rate limiting "
+              "drives pacing; the per-row delay is ignored)", file=sys.stderr)
+
     if not os.path.exists(args.csv):
         print(f"CSV file not found: {args.csv}", file=sys.stderr)
         return 2
@@ -312,6 +359,11 @@ def main(argv):
     else:
         print(f"Ingestion started. Protocol: ilp (HTTP, retry-timeout-ms={args.retry_timeout}) "
               f"| addrs: {','.join(addrs)}")
+
+    if args.rate > 0:
+        print(f"Pacing: rate={args.rate} rows/s (aggregate across {args.num_senders} workers)")
+    else:
+        print(f"Pacing: delay-ms={args.delay_ms}")
 
     counts = [0] * args.num_senders
     stop = threading.Event()

@@ -23,7 +23,7 @@ use clap::Parser;
 use questdb::egress::column::ColumnView;
 use questdb::egress::reader::{BatchView, Reader};
 use questdb::egress::FailoverEvent;
-use questdb::ingress::{Sender, TimestampMicros};
+use questdb::ingress::{Sender, TimestampNanos};
 
 const PROBE_QUERY: &str = "select timestamp from trades limit -1";
 // Enterprise lifecycle status of whichever node the query client is connected to. Returns
@@ -57,9 +57,15 @@ struct Args {
     #[arg(long, default_value_t = 1_000_000)]
     total_events: u64,
 
-    /// Per-row sleep in milliseconds (0 = as fast as possible).
+    /// Per-row sleep in milliseconds (0 = as fast as possible). Ignored when --rate > 0.
     #[arg(long, default_value_t = 50)]
     delay_ms: u64,
+
+    /// Target aggregate rows/second across ALL workers (0 = off, use --delay-ms). Takes
+    /// precedence over --delay-ms: each worker paces to rate/num-senders against a deadline
+    /// schedule, reaching high targets a per-row sleep cannot.
+    #[arg(long, default_value_t = 0)]
+    rate: u64,
 
     /// Number of worker threads (each is its own Sender).
     #[arg(long, default_value_t = 10)]
@@ -143,14 +149,14 @@ struct TradeRow {
     side: String,
     price: f64,
     amount: f64,
-    /// Microseconds since epoch, parsed at load time; only used with --timestamp-from-file.
-    ts_micros: i64,
+    /// Nanoseconds since epoch, parsed at load time; only used with --timestamp-from-file.
+    ts_nanos: i64,
 }
 
-fn now_micros() -> i64 {
+fn now_nanos() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
+        .map(|d| d.as_nanos() as i64)
         .unwrap_or(0)
 }
 
@@ -177,6 +183,22 @@ fn main() {
         eprintln!("--batches-per-transaction must be > 0");
         std::process::exit(2);
     }
+    // --rate takes precedence: when set it drives pacing and --delay-ms is ignored.
+    if args.rate > 0 && args.delay_ms > 0 {
+        eprintln!(
+            "[warn] --rate {} overrides --delay-ms {} (rate limiting drives pacing; the per-row \
+             delay is ignored)",
+            args.rate, args.delay_ms
+        );
+    }
+    println!(
+        "Pacing: {}",
+        if args.rate > 0 {
+            format!("rate={} rows/s (aggregate across {} workers)", args.rate, args.num_senders)
+        } else {
+            format!("delay-ms={}", args.delay_ms)
+        }
+    );
 
     let addrs = args.addr_list();
     if addrs.is_empty() {
@@ -304,10 +326,10 @@ fn run_worker(
 
     let is_qwp = args.protocol == "qwp";
     let is_udp = args.protocol == "qwpudp";
-    // Single worker on a QWP transport: stamp each row with the current micros client-side.
+    // Single worker on a QWP transport: stamp each row with the current time (nanos) client-side.
     // A single thread is monotonic (no O3) and this avoids QWP's per-batch atNow() stamping.
     // ILP, or more than one worker, use atNow() (server-side, O3-safe).
-    let per_row_micros = (is_qwp || is_udp) && args.num_senders == 1;
+    let per_row_ts = (is_qwp || is_udp) && args.num_senders == 1;
     // Flush cadence: qwp commits every batch-size*batches-per-transaction rows; qwpudp flushes
     // every batch-size rows (bounds the datagram burst); ilp flushes every batch-size rows too
     // (the Rust HTTP client has no auto-flush, so the buffer must be drained explicitly).
@@ -317,10 +339,22 @@ fn run_worker(
         args.batch_size
     };
 
+    // Rate limiting (when --rate > 0): pace this worker to its share of the aggregate target,
+    // rate / num-senders rows/second. interval_nanos is the ideal spacing between this worker's
+    // rows; we track a deadline from loop entry and sleep only when running ahead, so rows go
+    // out back-to-back until we get ahead. Reaches high rates a fixed per-row sleep cannot.
+    let interval_nanos: f64 = if args.rate > 0 {
+        1_000_000_000.0 * args.num_senders as f64 / args.rate as f64
+    } else {
+        0.0
+    };
+    let rate_limited = interval_nanos > 0.0;
+
     let mut sender = Sender::from_conf(build_ingest_conf(args, worker_id))?;
     let mut buffer = sender.new_buffer();
     let n = rows.len();
     let mut sent: u64 = 0;
+    let pace_start = Instant::now();
 
     for i in 0..total_events {
         let r = &rows[(i as usize) % n];
@@ -333,12 +367,12 @@ fn run_worker(
             .column_str("trade_id", format!("{worker_id}-{}", i + 1))?;
 
         if args.timestamp_from_file {
-            let ts = r.ts_micros + args.seconds_offset * 1_000_000;
-            buffer.at(TimestampMicros::new(ts))?;
+            let ts = r.ts_nanos + args.seconds_offset * 1_000_000_000;
+            buffer.at(TimestampNanos::new(ts))?;
         } else if args.seconds_offset != 0 {
-            buffer.at(TimestampMicros::new(now_micros() + args.seconds_offset * 1_000_000))?;
-        } else if per_row_micros {
-            buffer.at(TimestampMicros::new(now_micros()))?;
+            buffer.at(TimestampNanos::new(now_nanos() + args.seconds_offset * 1_000_000_000))?;
+        } else if per_row_ts {
+            buffer.at(TimestampNanos::new(now_nanos()))?;
         } else {
             buffer.at_now()?;
         }
@@ -349,7 +383,18 @@ fn run_worker(
         if sent.is_multiple_of(commit_every) {
             sender.flush(&mut buffer)?;
         }
-        if args.delay_ms > 0 {
+        if rate_limited {
+            // Deadline for the row just sent (sent is 1-based). Sleep only while ahead of
+            // schedule; the 1ms floor coalesces many rows into one sleep at high rates.
+            let target_nanos = (sent as f64 * interval_nanos) as u64;
+            let elapsed_nanos = pace_start.elapsed().as_nanos() as u64;
+            if target_nanos > elapsed_nanos {
+                let sleep_nanos = target_nanos - elapsed_nanos;
+                if sleep_nanos > 1_000_000 {
+                    thread::sleep(Duration::from_nanos(sleep_nanos));
+                }
+            }
+        } else if args.delay_ms > 0 {
             thread::sleep(Duration::from_millis(args.delay_ms));
         }
     }
@@ -620,12 +665,16 @@ fn load_csv(path: &str, need_timestamp: bool) -> Result<Vec<TradeRow>, Box<dyn s
         if rec.is_empty() {
             continue;
         }
-        let ts_micros = match i_ts {
+        let ts_nanos = match i_ts {
             Some(i) => {
                 let raw = rec.get(i).unwrap_or("").trim();
+                // Parse to nanoseconds so a TIMESTAMP_NS source keeps full precision; a micros
+                // target column truncates server-side. timestamp_nanos_opt is None only for
+                // dates outside ~1677-2262, which trade data never is.
                 chrono::DateTime::parse_from_rfc3339(raw)
-                    .map(|dt| dt.timestamp_micros())
                     .map_err(|e| format!("bad timestamp {raw:?}: {e}"))?
+                    .timestamp_nanos_opt()
+                    .ok_or_else(|| format!("timestamp out of nanosecond range: {raw:?}"))?
             }
             None => 0,
         };
@@ -634,7 +683,7 @@ fn load_csv(path: &str, need_timestamp: bool) -> Result<Vec<TradeRow>, Box<dyn s
             side: rec.get(i_side).unwrap_or("").trim().to_string(),
             price: rec.get(i_price).unwrap_or("").trim().parse()?,
             amount: rec.get(i_amount).unwrap_or("").trim().parse()?,
-            ts_micros,
+            ts_nanos,
         });
     }
     Ok(out)

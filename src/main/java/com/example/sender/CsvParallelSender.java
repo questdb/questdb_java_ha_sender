@@ -36,6 +36,13 @@ public class CsvParallelSender {
     private static final String DEFAULT_ADDRS = "questdb:9000";
     private static final long DEFAULT_TOTAL_EVENTS = 1_000_000L;
     private static final int DEFAULT_DELAY_MS = 50;
+    // Target aggregate generation rate in rows/second across ALL workers. 0 disables rate
+    // limiting and falls back to --delay-ms. When > 0 it takes precedence over --delay-ms:
+    // each worker paces itself to its share (rate / num-senders) against a deadline schedule,
+    // so the process approximates the target regardless of worker count. Unlike a fixed
+    // per-row sleep, it sends rows back-to-back and only sleeps when ahead of schedule, so it
+    // can sustain high rates (e.g. 300000) that a --delay-ms of >=1 could never reach.
+    private static final long DEFAULT_RATE = 0L;
     private static final int DEFAULT_NUM_SENDERS = 10;
     private static final int DEFAULT_RETRY_TIMEOUT = 360000;
     private static final String DEFAULT_CSV = "./trades20250728.csv.gz";
@@ -80,6 +87,7 @@ public class CsvParallelSender {
         final String password = a.get("--password");         // optional
         final long totalEvents = Long.parseLong(a.getOrDefault("--total-events", String.valueOf(DEFAULT_TOTAL_EVENTS)));
         final int delayMs = Integer.parseInt(a.getOrDefault("--delay-ms", String.valueOf(DEFAULT_DELAY_MS)));
+        final long rate = Long.parseLong(a.getOrDefault("--rate", String.valueOf(DEFAULT_RATE)));
         final int numSenders = Integer.parseInt(a.getOrDefault("--num-senders", String.valueOf(DEFAULT_NUM_SENDERS)));
         final int retryTimeout = Integer.parseInt(a.getOrDefault("--retry-timeout", String.valueOf(DEFAULT_RETRY_TIMEOUT)));
         final String csvPath = a.getOrDefault("--csv", DEFAULT_CSV);
@@ -148,12 +156,25 @@ public class CsvParallelSender {
             System.err.println("--total-events must be > 0");
             System.exit(2);
         }
+        if (rate < 0) {
+            System.err.println("--rate must be >= 0 (0 disables rate limiting, falling back to --delay-ms)");
+            System.exit(2);
+        }
+        // --rate takes precedence: when set it drives the pacing and --delay-ms is ignored.
+        if (rate > 0 && delayMs > 0 && a.containsKey("--delay-ms")) {
+            System.err.println("[warn] --rate " + rate + " overrides --delay-ms " + delayMs
+                    + " (rate limiting drives pacing; the per-row delay is ignored)");
+        }
 
         final SenderCfg cfg = new SenderCfg(protocol, addrsCsv, token, username, password, retryTimeout,
                 senderIdBase, storeForwardDir, batchSize, batchesPerTransaction, numSenders, enterprise, zone,
-                connectTimeoutMs);
+                connectTimeoutMs, rate);
 
+        final String pacing = rate > 0
+                ? "rate=" + rate + " rows/s (aggregate across " + numSenders + " workers)"
+                : "delay-ms=" + delayMs;
         final String conf = buildConf(addrsCsv, token, username, password, retryTimeout);
+        System.out.println("Pacing: " + pacing);
         System.out.println("Ingestion started. Protocol: " + protocol
                 + (protocol.equals("qwp")
                         ? " (WebSocket, sender-id=" + senderIdBase + ", store-and-forward=" + storeForwardDir
@@ -259,6 +280,16 @@ public class CsvParallelSender {
                 : isUdp
                         ? cfg.batchSize
                         : 0L;
+        // Rate limiting (when --rate > 0): pace this worker to its share of the aggregate
+        // target, rate / num-senders rows/second. intervalNanos is the ideal spacing between
+        // this worker's rows; we track a deadline schedule from loop entry and only sleep when
+        // we are running ahead of it, so rows go out back-to-back until we get ahead. This
+        // reaches high rates that a fixed per-row Thread.sleep cannot. 0 => rate disabled.
+        final double intervalNanos = cfg.rate > 0
+                ? 1_000_000_000.0 * cfg.numSenders / cfg.rate
+                : 0.0;
+        final boolean rateLimited = intervalNanos > 0.0;
+        final long paceStartNanos = System.nanoTime();
         try ( Sender sender = buildSender(cfg, senderId)) { //( Sender sender = Sender.fromConfig(conf)) {
             final int n = rows.size();
             for (long i = 0; i < totalEvents; i++) {
@@ -279,11 +310,11 @@ public class CsvParallelSender {
                     if (secondsOffset != 0) {
                         ts = ts.plusSeconds(secondsOffset);
                     }
-                    sender.at(ts);
+                    atNanos(sender, ts);
                 } else if (secondsOffset != 0) {
-                    sender.at(Instant.now().plusSeconds(secondsOffset));
+                    atNanos(sender, Instant.now().plusSeconds(secondsOffset));
                 } else if (perRowMicros) {
-                    sender.at(Instant.now());
+                    atNanos(sender, Instant.now());
                 } else {
                     sender.atNow();
                 }
@@ -296,7 +327,22 @@ public class CsvParallelSender {
                     sender.flush();
                 }
 
-                if (delayMs > 0) {
+                if (rateLimited) {
+                    // Deadline for the row we have just sent (sent is 1-based here). Sleep only
+                    // while ahead of schedule; if behind, fall through and keep sending. The 1ms
+                    // floor coalesces many rows into one sleep so we do not burn CPU sleeping for
+                    // sub-millisecond slivers at high rates.
+                    final long targetNanos = paceStartNanos + Math.round(sent * intervalNanos);
+                    final long sleepNanos = targetNanos - System.nanoTime();
+                    if (sleepNanos > 1_000_000L) {
+                        try {
+                            Thread.sleep(sleepNanos / 1_000_000L, (int) (sleepNanos % 1_000_000L));
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            throw new RuntimeException("Interrupted", ie);
+                        }
+                    }
+                } else if (delayMs > 0) {
                     try {
                         Thread.sleep(delayMs);
                     } catch (InterruptedException ie) {
@@ -312,6 +358,17 @@ public class CsvParallelSender {
             System.err.printf("Sender %d got error: %s%s%n", senderId, e.toString(), upgradeHint(e));
             throw new RuntimeException(e);
         }
+    }
+
+    // Send the designated timestamp at NANOSECOND resolution. The client's at(Instant) path
+    // delivers only microseconds (sub-microsecond digits are dropped before the wire), so we
+    // convert to epoch-nanos and use at(long, NANOS) to carry full nanosecond precision.
+    // QuestDB stores at the target column's resolution: a micros TIMESTAMP column silently
+    // truncates the extra digits, a TIMESTAMP_NS column keeps them. The multiply stays within
+    // long range for any realistic date (epochSecond * 1e9 overflows only past year ~2262).
+    private static void atNanos(Sender sender, Instant ts) {
+        final long epochNanos = ts.getEpochSecond() * 1_000_000_000L + ts.getNano();
+        sender.at(epochNanos, ChronoUnit.NANOS);
     }
 
     private static List<TradeRow> loadCsv(String path, boolean needTimestamp) throws Exception {
@@ -834,6 +891,7 @@ public class CsvParallelSender {
                 case "--password":
                 case "--total-events":
                 case "--delay-ms":
+                case "--rate":
                 case "--num-senders":
                 case "--csv":
                 case "--timestamp-from-file":
@@ -885,11 +943,13 @@ public class CsvParallelSender {
         final boolean enterprise;
         final String zone;
         final int connectTimeoutMs;
+        // Target aggregate rows/second across all workers; 0 = disabled (use delayMs).
+        final long rate;
 
         SenderCfg(String protocol, String addrsCsv, String token, String username, String password,
                   int retryTimeout, String senderIdBase, String storeForwardDir,
                   int batchSize, int batchesPerTransaction, int numSenders, boolean enterprise, String zone,
-                  int connectTimeoutMs) {
+                  int connectTimeoutMs, long rate) {
             this.protocol = protocol;
             this.addrsCsv = addrsCsv;
             this.token = token;
@@ -904,6 +964,7 @@ public class CsvParallelSender {
             this.enterprise = enterprise;
             this.zone = zone;
             this.connectTimeoutMs = connectTimeoutMs;
+            this.rate = rate;
         }
     }
 }

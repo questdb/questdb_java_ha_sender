@@ -48,6 +48,7 @@ struct Args {
     std::string token, username, password;
     uint64_t total_events = 1'000'000;
     uint64_t delay_ms = 50;
+    uint64_t rate = 0;  // target aggregate rows/s across all workers (0 = off, use delay_ms)
     unsigned num_senders = 10;
     uint64_t retry_timeout = 360'000;
     std::string csv = "./trades20250728.csv.gz";
@@ -266,10 +267,19 @@ void run_worker(unsigned worker_id, uint64_t total_events, const Args& args,
     const uint64_t commit_every =
         is_qwp ? args.batch_size * args.batches_per_transaction : args.batch_size;
 
+    // Rate limiting (when --rate > 0): pace this worker to its share of the aggregate target,
+    // rate / num-senders rows/second. interval_nanos is the ideal spacing between this worker's
+    // rows; we sleep only when running ahead of a deadline schedule, so rows go out back-to-back
+    // until we get ahead. Reaches high targets a fixed per-row sleep cannot.
+    const double interval_nanos =
+        args.rate > 0 ? 1'000'000'000.0 * args.num_senders / static_cast<double>(args.rate) : 0.0;
+    const bool rate_limited = interval_nanos > 0.0;
+
     auto sender = qi::line_sender::from_conf(qi::utf8_view{build_ingest_conf(args, worker_id)});
     auto buffer = sender.new_buffer();
     const size_t n = rows.size();
     uint64_t sent = 0;
+    const auto pace_start = std::chrono::steady_clock::now();
 
     for (uint64_t i = 0; i < total_events; ++i) {
         const TradeRow& r = rows[i % n];
@@ -293,8 +303,22 @@ void run_worker(unsigned worker_id, uint64_t total_events, const Args& args,
         ++sent;
         total_sent.fetch_add(1, std::memory_order_relaxed);
         if (sent % commit_every == 0) sender.flush(buffer);
-        if (args.delay_ms > 0)
+        if (rate_limited) {
+            // Deadline for the row just sent (sent is 1-based). Sleep only while ahead of
+            // schedule; the 1ms floor coalesces many rows into one sleep at high rates.
+            const uint64_t target_nanos = static_cast<uint64_t>(sent * interval_nanos);
+            const uint64_t elapsed_nanos = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - pace_start)
+                    .count());
+            if (target_nanos > elapsed_nanos) {
+                const uint64_t sleep_nanos = target_nanos - elapsed_nanos;
+                if (sleep_nanos > 1'000'000)
+                    std::this_thread::sleep_for(std::chrono::nanoseconds(sleep_nanos));
+            }
+        } else if (args.delay_ms > 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(args.delay_ms));
+        }
     }
     sender.flush(buffer);
     if (is_qwp) sender.close_drain();  // drain un-acked store-and-forward frames
@@ -407,6 +431,7 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--password") a.password = need_value(i, argc, argv);
         else if (k == "--total-events") a.total_events = std::stoull(need_value(i, argc, argv));
         else if (k == "--delay-ms") a.delay_ms = std::stoull(need_value(i, argc, argv));
+        else if (k == "--rate") a.rate = std::stoull(need_value(i, argc, argv));
         else if (k == "--num-senders") a.num_senders = std::stoul(need_value(i, argc, argv));
         else if (k == "--retry-timeout") a.retry_timeout = std::stoull(need_value(i, argc, argv));
         else if (k == "--csv") a.csv = need_value(i, argc, argv);
@@ -456,6 +481,12 @@ int main(int argc, char** argv) {
                                  "connection); ignoring --token/--username/--password\n");
     }
 
+    // --rate takes precedence: when set it drives pacing and --delay-ms is ignored.
+    if (args.rate > 0 && args.delay_ms > 0)
+        std::fprintf(stderr, "[warn] --rate %llu overrides --delay-ms %llu (rate limiting drives "
+                             "pacing; the per-row delay is ignored)\n",
+                     (unsigned long long)args.rate, (unsigned long long)args.delay_ms);
+
     std::vector<TradeRow> rows;
     try {
         load_csv(args.csv, args.timestamp_from_file, rows);
@@ -464,6 +495,12 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (rows.empty()) { std::fprintf(stderr, "CSV has no data rows: %s\n", args.csv.c_str()); return 2; }
+
+    if (args.rate > 0)
+        std::printf("Pacing: rate=%llu rows/s (aggregate across %u workers)\n",
+                    (unsigned long long)args.rate, args.num_senders);
+    else
+        std::printf("Pacing: delay-ms=%llu\n", (unsigned long long)args.delay_ms);
 
     if (args.protocol == "qwp")
         std::printf("Ingestion started. Protocol: qwp (WebSocket, sender-id=%s, "

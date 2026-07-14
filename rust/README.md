@@ -67,7 +67,8 @@ a server-side `SELECT count() FROM trades` after a run.
 | `--token` | | Bearer token (QWP/WebSocket + ILP). UDP rejects auth. |
 | `--username` / `--password` | | Basic auth (QWP/WebSocket + ILP). |
 | `--total-events` | `1000000` | Rows across all workers. |
-| `--delay-ms` | `50` | Per-row sleep. |
+| `--delay-ms` | `50` | Per-row sleep. Ignored when `--rate > 0`. |
+| `--rate` | `0` | Target **aggregate** rows/second across all workers (`0` = off). Takes precedence over `--delay-ms`; see [Pacing](#pacing-delay-ms-vs-rate). |
 | `--num-senders` | `10` | Worker threads (one `Sender` each). |
 | `--retry-timeout` | `360000` | `retry_timeout` (ILP) / `reconnect_max_duration_millis` (QWP). |
 | `--csv` | `./trades20250728.csv.gz` | `.csv` or `.csv.gz`; needs `symbol,side,price,amount[,timestamp]`. |
@@ -82,11 +83,30 @@ a server-side `SELECT count() FROM trades` after a run.
 | `--enterprise` | `false` | Request durable acks (Enterprise only). |
 | `--zone` | `eu-west-1` | Preferred zone for the query client / probe. |
 
+## Pacing: `--delay-ms` vs `--rate`
+
+- `--delay-ms` (default `50`): a fixed sleep after **every row**, per worker. A poor throttle
+  at speed — the fixed per-row cost caps throughput well under 1000 rows/s at `1`ms.
+- `--rate` (default `0` = off): a **target aggregate rate in rows/second across all workers**.
+  Each worker paces to its share (`rate / num-senders`) against a deadline schedule, sending
+  rows back-to-back and sleeping only when it runs *ahead*. This reaches high targets a per-row
+  sleep never could (e.g. `--rate 300000`). When `> 0` it takes precedence over `--delay-ms`
+  (a warning prints if both are set). Measured: `--rate 5000`, 20k rows, 4 workers → ~5.0 s,
+  steady ~5000 rows/s.
+
 ## Timestamps
 
+The generator sends timestamps at **nanosecond** resolution (`TimestampNanos`), and QuestDB
+stores them at the **target column's** resolution: a `TIMESTAMP_NS` column keeps full nanos, a
+micros `TIMESTAMP` column truncates the extra digits (silently, never an error). **If the table
+does not exist, the server auto-creates it as `TIMESTAMP_NS`.** Pre-create `trades` with a
+`timestamp` (micros) column if you want micros. Verified: replaying the nanosecond FX chunk with
+`--timestamp-from-file` preserved `...192508297Z` end-to-end in an auto-created `TIMESTAMP_NS`
+table.
+
 - **Single worker on a QWP transport** (`qwp` or `qwpudp`, `--num-senders 1`): each row is
-  stamped with the current microsecond client-side (monotonic, so no out-of-order), giving
-  distinct per-row timestamps.
+  stamped with the current time client-side (monotonic, so no out-of-order), giving distinct
+  per-row timestamps.
 - **ILP, or more than one worker**: rows use server-side `at_now()` (O3-safe across workers;
   a whole batch shares one timestamp).
 - `--timestamp-from-file` / `--seconds-offset` stamp each row explicitly from the CSV.
@@ -131,6 +151,7 @@ Smoke-tested against a local QuestDB (OSS) with all rows accounted for server-si
 | `qwpudp` | 2000 rows, 1 worker | 2000 / 2000 |
 | `qwp` | 5000 rows, 1 worker | 5000 / 5000, distinct per-row timestamps; probe reported live timestamps + role |
 | `qwp` | 20000 rows, 4 workers | 20000 / 20000, one store-and-forward dir per worker |
+| `qwp` | `--rate 5000`, nanos FX, `--timestamp-from-file`, 4 workers | steady ~5000 rows/s; auto-created `TIMESTAMP_NS` table preserved `...192508297Z` |
 
 ### QWP failover (primary crash)
 

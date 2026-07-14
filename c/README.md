@@ -49,11 +49,30 @@ match the target server build.
 ```
 
 Flags mirror the other ports: `--addrs`, `--token`/`--username`/`--password`, `--total-events`,
-`--delay-ms`, `--num-senders`, `--retry-timeout`, `--csv`, `--timestamp-from-file`,
+`--delay-ms`, `--rate`, `--num-senders`, `--retry-timeout`, `--csv`, `--timestamp-from-file`,
 `--seconds-offset`, `--protocol`, `--sender-id`, `--store-forward-dir`, `--batch-size`,
 `--batches-per-transaction`, `--probe-interval-ms`, `--enterprise`, `--zone`.
 (`--timestamp-from-file` and `--enterprise` are presence flags.) Confirm results server-side with
 `SELECT count() FROM trades`.
+
+## Pacing: `--delay-ms` vs `--rate`
+
+- `--delay-ms` (default `50`): a fixed sleep after **every row**, per worker.
+- `--rate` (default `0` = off): a **target aggregate rate in rows/second across all workers**.
+  Each worker paces to its share (`rate / num-senders`) against a deadline schedule, sending
+  rows back-to-back and sleeping only when it runs *ahead* — reaching high targets a per-row
+  sleep never could. When `> 0` it takes precedence over `--delay-ms` (a warning prints if both
+  are set). Measured: `--rate 5000`, 20k rows, 4 workers → ~5.0 s, steady ~5000 rows/s.
+
+## Timestamps
+
+The generator sends timestamps at **nanosecond** resolution (`timestamp_nanos`), and QuestDB
+stores them at the **target column's** resolution: a `TIMESTAMP_NS` column keeps full nanos, a
+micros `TIMESTAMP` column truncates the extra digits (silently, never an error). **If the table
+does not exist, the server auto-creates it as `TIMESTAMP_NS`.** Pre-create `trades` with a
+`timestamp` (micros) column if you want micros. The CSV parser already reads fractional seconds
+to full nanosecond precision. Verified: replaying the nanosecond FX chunk with
+`--timestamp-from-file` preserved `...192508297Z` in an auto-created `TIMESTAMP_NS` table.
 
 ## Probe (QWP/WebSocket only)
 
@@ -83,6 +102,7 @@ Against a local QuestDB (OSS), all rows accounted for server-side:
 | `qwp`, 4000 rows, 1 worker | 4000 / 4000, distinct per-row timestamps; probe reported live timestamps + handshake role fallback |
 | `ilp`, 2000 rows, 2 workers | 2000 / 2000 |
 | `qwpudp` (paced) | rows land; best-effort, lossy under fast bursts |
+| `qwp`, `--rate 5000`, nanos FX, `--timestamp-from-file`, 4 workers | steady ~5000 rows/s; auto-created `TIMESTAMP_NS` table preserved `...192508297Z` |
 | QWP failover (primary crash) | see below |
 
 ### QWP failover (primary crash)
