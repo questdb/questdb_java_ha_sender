@@ -181,6 +181,17 @@ def main(argv):
     if not os.path.exists(args.csv):
         print(f"CSV file not found: {args.csv}", file=sys.stderr)
         return 2
+    # An empty --token (typically an unset env var, e.g. --token "$ILP_TOKEN" with
+    # ILP_TOKEN unset) silently disables auth+TLS. Against a TLS/auth server the client
+    # then hangs retrying the handshake at sent=0, so fail loudly instead.
+    if args.token is not None and not args.token.strip():
+        print("[error] --token is empty (is $ILP_TOKEN set and exported?). It would connect "
+              "with NO auth/TLS and hang against a secured server. Set the token, or drop "
+              "--token to connect plaintext on purpose.", file=sys.stderr)
+        return 2
+    if args.username and not (args.password or "").strip():
+        print("[error] --username given but --password is empty.", file=sys.stderr)
+        return 2
 
     base = load_base(args.csv, args.timestamp_from_file)
     if base.height == 0:
@@ -220,14 +231,23 @@ def main(argv):
         except Exception as e:  # noqa: BLE001
             errors.append(f"Sender {wid}: {e}")
 
+    # Daemon workers + a polling join so Ctrl+C is honoured even while a worker is
+    # blocked in a native connect/flush: KeyboardInterrupt fires between join timeouts,
+    # and daemon threads don't hold the process open once main returns.
     threads = []
     for wid in range(args.num_senders):
         ev = base_events + (1 if wid < rem else 0)
-        t = threading.Thread(target=wrapper, args=(wid, ev))
+        t = threading.Thread(target=wrapper, args=(wid, ev), daemon=True)
         t.start()
         threads.append(t)
-    for t in threads:
-        t.join()
+    try:
+        while any(t.is_alive() for t in threads):
+            for t in threads:
+                t.join(0.2)
+    except KeyboardInterrupt:
+        stop.set()
+        print(f"\nInterrupted. Sent ~{sum(counts):,} rows; exiting.", file=sys.stderr)
+        return 130
     stop.set()
 
     if errors:
