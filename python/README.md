@@ -174,8 +174,11 @@ reads) and fails over across the `--addrs` hosts.
   over QWP (row-threshold flush fires mid-stream; see Validated). This port sets
   `auto_flush=off` and flushes at the same batch boundaries as the Java/Rust ports for
   identical cadence.
-- **Config-string scheme is `qwpws`/`qwpwss` for both the sender and the query client**
-  (the Rust reader used `ws`/`wss`; Python only accepts the `qwp*` schemes).
+- **Config-string scheme is `qwpws`/`qwpwss` for both the sender and the query client.**
+  `qwpws`/`qwpwss` are the deprecated aliases (the Rust/C++ ports and their readers use the
+  newer `ws`/`wss`), but the Python binding's `Protocol` enum only exposes `QwpWs`/`QwpWss`, so
+  `ws`/`wss` are rejected here (`ValueError: Invalid value for Protocol`). Python must stay on
+  `qwpws`/`qwpwss` until the binding adds the `ws`/`wss` aliases.
 - **The probe has no handshake-role fallback** — because the Python binding does not expose it.
   Java/Rust fall back to the QWP handshake role when `switch status` is unavailable. That role
   exists in the underlying C client (`line_reader_server_info_role`/`_role_byte`) and the Rust

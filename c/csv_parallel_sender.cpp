@@ -117,12 +117,13 @@ std::string build_ingest_conf(const Args& a, unsigned worker_id) {
         c += "retry_timeout=" + std::to_string(a.retry_timeout) + ";";
         return c;
     }
-    // qwp (WebSocket)
+    // qwp (WebSocket). Use the spec aliases ws/wss (qwpws/qwpwss are deprecated); the client
+    // maps ws -> QwpWs and wss -> QwpWss, matching the reader conf below.
     std::string who = a.sender_id + "-" + std::to_string(worker_id);
     std::string sf = a.store_forward_dir + "/" + who;
     std::error_code ec;
     std::filesystem::create_directories(sf, ec);
-    std::string c = (use_tls(a) ? "qwpwss" : "qwpws");
+    std::string c = (use_tls(a) ? "wss" : "ws");
     c += "::addr=" + joined + ";";
     append_auth(c, a);
     if (use_tls(a)) c += "tls_verify=unsafe_off;";

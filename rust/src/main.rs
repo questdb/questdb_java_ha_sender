@@ -424,8 +424,9 @@ fn build_ingest_conf(args: &Args, worker_id: usize) -> String {
             c
         }
         _ => {
-            // qwp (WebSocket)
-            let scheme = if args.tls() { "qwpwss" } else { "qwpws" };
+            // qwp (WebSocket). Use the spec aliases ws/wss (qwpws/qwpwss are deprecated); the
+            // client maps ws -> QwpWs and wss -> QwpWss.
+            let scheme = if args.tls() { "wss" } else { "ws" };
             let who = format!("{}-{worker_id}", args.sender_id);
             let sf = format!("{}/{who}", args.store_forward_dir);
             let _ = std::fs::create_dir_all(&sf);

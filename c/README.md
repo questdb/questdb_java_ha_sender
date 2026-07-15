@@ -88,7 +88,9 @@ the `--addrs` hosts.
 
 - **No auto-flush** (like Rust; unlike Java/Python) — the C/C++ client has none, so batching is
   driven purely by explicit `flush()` at the same boundaries as the other ports.
-- **Reader scheme is `ws`/`wss`** (like Rust; Python required `qwpws`).
+- **Both the sender and reader use the `ws`/`wss` scheme** (like Rust; `qwpws`/`qwpwss` are the
+  deprecated aliases — the client maps `ws`->QwpWs, `wss`->QwpWss). Python still requires `qwpws`
+  because its binding does not yet accept the `ws`/`wss` aliases.
 - Row values from the CSV are validated UTF-8 via `utf8_view` at build time (throws on invalid
   input); fixed column names use the `_cn` / `_tn` literals.
 - Threads via `std::thread`, one `line_sender` per worker (unique `sender_id` + spill dir).
