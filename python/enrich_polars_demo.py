@@ -140,7 +140,7 @@ def main(argv):
     target = f"enriched_{args.table}_demo"
     rng = np.random.default_rng(args.seed)
     conf = build_conf(args)
-    print(f"[conf]   {conf.split('::')[0]} tls={use_tls(args)} "
+    print(f"[conf]   {'wss' if use_tls(args) else 'ws'} tls={use_tls(args)} "
           f"auth={'token' if args.token else 'basic' if args.username else 'none'}")
 
     if not args.keep:
