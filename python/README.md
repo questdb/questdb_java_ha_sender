@@ -8,6 +8,52 @@ timestamp and the serving node's live role.
 Built on the QuestDB Python client (`questdb.ingress`), which wraps the same C/Rust client
 as the other ports.
 
+## Which script to use
+
+This port has grown a few scripts. Pick by what you need:
+
+| Script | Use it for | Path / speed |
+| --- | --- | --- |
+| `csv_columnar_sender.py` | **High-throughput ingestion** - bulk CSV replay at volume | Columnar QWP (`Client.dataframe`, Arrow/polars). Fastest Python path; flat memory. |
+| `csv_parallel_sender.py` | **HA / failover demos** - store-and-forward durability, the live probe, `qwpudp`/`ilp` comparison, and the per-event `row()` API | Row-by-row QWP/UDP/ILP. Correct but slow for volume - keep `--total-events` and the batch window small. |
+| `read_bench.py` | Measuring read/scan throughput (rows/s) of a table | Streaming `iter_arrow()` egress. |
+| `enrich_polars_demo.py` | Read a table as polars, enrich, write it back as polars | Streaming read + columnar write. |
+| `dataframe_demo.py` | pandas/polars ingestion + egress round-trip showcase | `Sender.dataframe` / `Client.dataframe`. |
+
+**Row-by-row vs columnar.** `sender.row()` in a Python loop is the *slowest* path: every cell
+crosses the Python/Cython boundary under the GIL (the client's own perf notes call it "~16x
+slower" than the columnar bulk path). `Client.dataframe` ships whole Arrow columns to the
+native client - the only Python path that reaches Java/Rust-class throughput. So use
+`csv_columnar_sender.py` for volume, and reach for `csv_parallel_sender.py` **only** when you
+need store-and-forward failover, which the columnar path deliberately bypasses (dataframe
+ingestion uses the direct column sender, not store-and-forward). Do not push high volume
+(e.g. 100M rows) through the row-by-row sender - its per-row Python cost plus a large flush
+window will pin the buffer in memory and can OOM the host.
+
+```bash
+# Fast columnar ingestion (recommended for volume):
+python csv_columnar_sender.py \
+  --addrs host:9000 --total-events 100000000 \
+  --num-senders 2 --chunk-rows 100000 --csv ../trades.csv \
+  --token "$QDB_TOKEN" --tls-verify unsafe_off
+```
+
+## Network tuning for throughput (important on real networks)
+
+The Rust/C/Python QWP clients hardcode a 4 MiB socket buffer, which default Linux silently
+clamps to ~416 KB and pins each connection at ~426 KB **per RTT** - a hard throughput cap on
+a real network (e.g. ~210k rows/s at 20 ms RTT, while Java, which does not touch socket
+buffers, does ~52 MB/s). Two levers:
+
+- Run [`boost_tcp.sh`](../boost_tcp.sh) on **both** the sender and server hosts to raise
+  `net.core.wmem_max`/`rmem_max` (and friends) so the client's 4 MiB buffer request actually
+  goes through instead of being clamped. It is runtime-only (resets on reboot); persist via
+  `/etc/sysctl.d/` if you want it permanent.
+- Prefer **multiple senders** (`--num-senders`): the cap is per connection, so parallel
+  connections multiply throughput (~11M rows/s with 2 connections same-zone EC2 in the
+  client team's tests, vs ~4M with 1). The tuning affects egress too, so it also speeds up
+  `read_bench.py` on a high-RTT link.
+
 ## Important: the client must be built from source
 
 The QWP transports (`qwpws`/`qwpwss`/`qwpudp`) **and the query client / egress reader are not
