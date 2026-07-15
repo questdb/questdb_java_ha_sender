@@ -100,7 +100,7 @@ def split_queries(args, conf):
     return sqls
 
 
-def run_reader(idx, sql, conf, counts, byts, errors):
+def run_reader(idx, sql, conf, counts, byts, errors, sample_n, sample_out):
     try:
         with Client.from_conf(conf) as client:
             result = client.query(sql)
@@ -109,6 +109,11 @@ def run_reader(idx, sql, conf, counts, byts, errors):
             for batch in result.iter_arrow():
                 n += batch.num_rows        # count rows and decoded Arrow bytes
                 b += batch.nbytes          # (buffer bytes of this batch's columns)
+                if idx == 0 and sample_n > 0 and sample_out[0] is None:
+                    # Reuse the Arrow data we already received: wrap the first batch as a polars
+                    # DataFrame (zero-copy) and keep its head (one-off, no extra query, no re-scan).
+                    import polars as pl
+                    sample_out[0] = pl.from_arrow(batch).head(sample_n)
                 counts[idx] = n
                 byts[idx] = b
             counts[idx] = n
@@ -129,6 +134,8 @@ def main(argv):
                     help="designated timestamp column (used to split across readers)")
     ap.add_argument("--report-interval", type=float, default=0.5,
                     help="seconds between progress lines; default 0.5")
+    ap.add_argument("--sample", type=int, default=5,
+                    help="after the scan, show this many rows as a polars DataFrame (0 to disable)")
     # Enterprise auth / TLS
     ap.add_argument("--token", default=None, help="bearer token (turns on TLS)")
     ap.add_argument("--username", default=None, help="basic-auth username (turns on TLS)")
@@ -153,6 +160,7 @@ def main(argv):
     counts = [0] * readers
     byts = [0] * readers
     errors = []
+    sample_out = [None]   # reader 0 fills this with a few rows off its first Arrow batch
     stop = threading.Event()
 
     def reporter():
@@ -172,7 +180,8 @@ def main(argv):
     t0 = time.monotonic()
     threads = []
     for i, sql in enumerate(sqls):
-        t = threading.Thread(target=run_reader, args=(i, sql, conf, counts, byts, errors))
+        t = threading.Thread(target=run_reader,
+                             args=(i, sql, conf, counts, byts, errors, args.sample, sample_out))
         t.start()
         threads.append(t)
     for t in threads:
@@ -201,6 +210,16 @@ def main(argv):
     if readers > 1:
         per = "  ".join(f"r{i}={c:,}" for i, c in enumerate(counts))
         print(f"[done]   per-reader rows: {per}")
+
+    # An extract of the data we actually received: a few rows sliced off the first Arrow batch
+    # during the scan (no extra query, no re-scan) and rendered as a polars DataFrame.
+    if args.sample > 0 and sample_out[0] is not None:
+        import polars as pl
+        df = sample_out[0]
+        print(f"\n[sample] first {df.height} row(s) received, as a polars DataFrame "
+              f"(reused from the scanned Arrow batches - no extra query):")
+        with pl.Config(tbl_rows=args.sample, tbl_cols=-1):
+            print(df)
     return 0
 
 
