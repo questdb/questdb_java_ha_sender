@@ -76,6 +76,31 @@ def build_conf(args):
     return "".join(parts)
 
 
+def preflight(conf, timeout_s):
+    """Check the server answers within timeout_s over the full path (TCP+TLS+auth+query),
+    in a daemon thread so a hung native connect can't block us. Returns (ok, message).
+    Without this, a down/unreachable/misconfigured server makes the ingest client retry
+    forever and sit at sent=0."""
+    outcome = {}
+
+    def probe():
+        try:
+            with Client.from_conf(conf) as c:
+                c.query("select 1").to_polars()
+            outcome["ok"] = True
+        except Exception as e:  # noqa: BLE001
+            outcome["err"] = str(e)
+
+    t = threading.Thread(target=probe, daemon=True)
+    t.start()
+    t.join(timeout_s)
+    if t.is_alive():
+        return False, f"no response within {timeout_s:g}s (server down / unreachable / wrong host or port?)"
+    if outcome.get("ok"):
+        return True, None
+    return False, outcome.get("err", "unknown error")
+
+
 def load_base(path, need_timestamp):
     """Load the CSV once into a compact polars DataFrame. symbol/side become
     Categorical (-> SYMBOL), price/amount Float64, and (if needed) timestamp is
@@ -168,6 +193,9 @@ def main(argv):
     ap.add_argument("--tls", action="store_true", help="force TLS (qwpwss) with no auth")
     ap.add_argument("--tls-verify", choices=["on", "unsafe_off"], default="on",
                     help="certificate verification; use unsafe_off for self-signed")
+    ap.add_argument("--connect-timeout", type=float, default=10.0,
+                    help="seconds to wait for the server on a preflight check before failing "
+                         "loudly (0 = skip; the ingest client would otherwise retry forever)")
     args = ap.parse_args(argv)
 
     for name, val in (("--total-events", args.total_events), ("--num-senders", args.num_senders),
@@ -198,9 +226,20 @@ def main(argv):
         print("CSV has no data rows.", file=sys.stderr)
         return 2
 
-    print(f"[conf]   {build_conf(args).split('::')[0]} tls={use_tls(args)} "
+    conf = build_conf(args)
+    print(f"[conf]   {conf.split('::')[0]} tls={use_tls(args)} "
           f"auth={'token' if args.token else 'basic' if args.username else 'none'} "
           f"| addrs: {args.addrs}")
+
+    if args.connect_timeout > 0:
+        t0 = time.monotonic()
+        ok, msg = preflight(conf, args.connect_timeout)
+        if not ok:
+            print(f"[error] preflight failed: {msg}. Is QuestDB up and the token/addr correct? "
+                  f"(set --connect-timeout 0 to skip this check)", file=sys.stderr)
+            return 2
+        print(f"[preflight] server reachable ({time.monotonic() - t0:.2f}s)")
+
     print(f"Ingestion started (columnar QWP). base={base.height:,} rows, "
           f"total={args.total_events:,}, workers={args.num_senders}, chunk-rows={args.chunk_rows:,}, "
           f"timestamps={'file' if args.timestamp_from_file else 'live-now'}, "
