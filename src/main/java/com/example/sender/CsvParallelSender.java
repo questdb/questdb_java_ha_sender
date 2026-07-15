@@ -79,6 +79,9 @@ public class CsvParallelSender {
     // Rows the server has acknowledged, per worker (summed by the reporter). Fed from the QWP
     // ack watermark (getAckedFsn) - the real committed count, with no extra query round-trips.
     private static AtomicLong[] ACKED_ROWS = new AtomicLong[0];
+    // Set once all rows are submitted: silences the per-second progress + probe lines so the
+    // commit-drain tail is quiet and only the final summary line is printed.
+    private static volatile boolean SUBMIT_COMPLETE = false;
 
     public static void main(String[] args) throws Exception {
         // Parse CLI flags
@@ -236,9 +239,15 @@ public class CsvParallelSender {
                 }
                 if (sub >= totalEvents) {
                     appendDoneNanos.compareAndSet(0, System.nanoTime());
+                    SUBMIT_COMPLETE = true;
                 }
                 if (ack >= totalEvents) {
                     commitDoneNanos.compareAndSet(0, System.nanoTime());
+                }
+                // Once everything is submitted, go quiet - no per-second spam while the client
+                // drains. The final "All workers completed ..." summary is the single last line.
+                if (SUBMIT_COMPLETE) {
+                    continue;
                 }
                 System.out.printf("[progress] submitted=%,d (+%,d/s) | acknowledged=%,d (+%,d/s)%n",
                         sub, sub - lastSub, ack, ack - lastAck);
@@ -852,8 +861,10 @@ public class CsvParallelSender {
                                 served = " served by role=" + handshake + " node=" + node + " zone=" + zone
                                         + " (handshake role; live 'switch status' unavailable, may be stale)";
                             }
-                            System.out.printf("[probe] latest trades timestamp = %s (raw=%d)%s%n",
-                                    ts, latest[0], served);
+                            if (!SUBMIT_COMPLETE) {
+                                System.out.printf("[probe] latest trades timestamp = %s (raw=%d)%s%n",
+                                        ts, latest[0], served);
+                            }
                             // Explain a missing live role at most once per 30s so it does not spam.
                             if (currentRole[0] == null && statusDiag[0] != null) {
                                 final long now = System.currentTimeMillis();
