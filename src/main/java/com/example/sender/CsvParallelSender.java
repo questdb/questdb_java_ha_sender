@@ -76,6 +76,9 @@ public class CsvParallelSender {
 
     // Rows sent (client-side) across all workers, for the once-per-second progress reporter.
     private static final AtomicLong TOTAL_SENT = new AtomicLong();
+    // Rows the server has acknowledged, per worker (summed by the reporter). Fed from the QWP
+    // ack watermark (getAckedFsn) - the real committed count, with no extra query round-trips.
+    private static AtomicLong[] ACKED_ROWS = new AtomicLong[0];
 
     public static void main(String[] args) throws Exception {
         // Parse CLI flags
@@ -201,18 +204,46 @@ public class CsvParallelSender {
         // Time only the ingestion: start right before the workers begin sending.
         final long startNanos = System.nanoTime();
 
-        // Progress reporter: prints rows/s (client-side, sent) once per second.
+        // Per-worker acknowledged-row counters, summed by the reporter. Fed from the QWP ack
+        // watermark (getAckedFsn) - the real committed progress, with no extra query round-trips.
+        ACKED_ROWS = new AtomicLong[numSenders];
+        for (int i = 0; i < numSenders; i++) {
+            ACKED_ROWS[i] = new AtomicLong();
+        }
+
+        // Records (to ~1s resolution) when all rows were submitted and when all were acknowledged,
+        // so the summary can separate the submit phase from the commit-drain tail.
+        final AtomicLong appendDoneNanos = new AtomicLong(0);
+        final AtomicLong commitDoneNanos = new AtomicLong(0);
+
+        // Progress reporter: once per second, prints BOTH counters - submitted (client-side, can
+        // run ahead of the server) and acknowledged (rows the server has actually committed). The
+        // gap between them is the buffered backlog; during the drain, submitted is flat while
+        // acknowledged keeps climbing (real work), so there is no misleading "0 rows/s".
         final Thread reporter = new Thread(() -> {
-            long last = 0;
+            long lastSub = 0;
+            long lastAck = 0;
             while (true) {
                 try {
                     Thread.sleep(1000);
                 } catch (InterruptedException ie) {
                     return;
                 }
-                long now = TOTAL_SENT.get();
-                System.out.printf("[progress] sent=%,d rate=%,d rows/s%n", now, now - last);
-                last = now;
+                final long sub = TOTAL_SENT.get();
+                long ack = 0;
+                for (AtomicLong al : ACKED_ROWS) {
+                    ack += al.get();
+                }
+                if (sub >= totalEvents) {
+                    appendDoneNanos.compareAndSet(0, System.nanoTime());
+                }
+                if (ack >= totalEvents) {
+                    commitDoneNanos.compareAndSet(0, System.nanoTime());
+                }
+                System.out.printf("[progress] submitted=%,d (+%,d/s) | acknowledged=%,d (+%,d/s)%n",
+                        sub, sub - lastSub, ack, ack - lastAck);
+                lastSub = sub;
+                lastAck = ack;
             }
         });
         reporter.setDaemon(true);
@@ -249,8 +280,17 @@ public class CsvParallelSender {
         }
         final double elapsedSec = (System.nanoTime() - startNanos) / 1_000_000_000.0;
         final double rowsPerSec = elapsedSec > 0 ? totalEvents / elapsedSec : 0;
-        System.out.printf("All workers completed. protocol=%s events=%d elapsed=%.3f s throughput=%,.0f rows/s%n",
+        System.out.printf("All workers completed. protocol=%s events=%d elapsed=%.3f s throughput=%,.0f rows/s (acknowledged, end-to-end)%n",
                 protocol, totalEvents, elapsedSec, rowsPerSec);
+        // Split the wall time into submit vs commit-drain, so the fast "submitted" rate is not
+        // mistaken for durable throughput. appendDoneNanos/commitDoneNanos are ~1s-resolution.
+        final long submitNanos = appendDoneNanos.get();
+        if (submitNanos > 0) {
+            final double submitSec = (submitNanos - startNanos) / 1_000_000_000.0;
+            final double submitRate = submitSec > 0 ? totalEvents / submitSec : 0;
+            System.out.printf("  submit phase %.3f s (%,.0f rows/s submitted) + commit drain %.3f s%n",
+                    submitSec, submitRate, Math.max(0.0, elapsedSec - submitSec));
+        }
     }
 
     private static void runWorker(
@@ -290,6 +330,9 @@ public class CsvParallelSender {
                 : 0.0;
         final boolean rateLimited = intervalNanos > 0.0;
         final long paceStartNanos = System.nanoTime();
+        // QWP ack tracking: map each flush sequence -> cumulative rows, so getAckedFsn() can be
+        // resolved to acknowledged rows. Only QWP carries frame sequence numbers and acks.
+        final java.util.TreeMap<Long, Long> fsnToRows = isQwp ? new java.util.TreeMap<>() : null;
         try ( Sender sender = buildSender(cfg, senderId)) { //( Sender sender = Sender.fromConfig(conf)) {
             final int n = rows.size();
             for (long i = 0; i < totalEvents; i++) {
@@ -322,9 +365,16 @@ public class CsvParallelSender {
                 sent++;
                 TOTAL_SENT.incrementAndGet();
 
-                // QWP-only: commit a transaction every batchSize * batchesPerTransaction rows.
+                // Commit a transaction every batchSize * batchesPerTransaction rows (QWP), or flush
+                // every batchSize rows (UDP). For QWP, record the flush sequence and refresh this
+                // worker's acknowledged-row count from the ack watermark (no extra round-trip).
                 if (commitEveryRows > 0 && sent % commitEveryRows == 0) {
-                    sender.flush();
+                    if (isQwp) {
+                        fsnToRows.put(sender.flushAndGetSequence(), sent);
+                        ACKED_ROWS[senderId].set(ackedRows(sender, fsnToRows));
+                    } else {
+                        sender.flush();
+                    }
                 }
 
                 if (rateLimited) {
@@ -351,13 +401,33 @@ public class CsvParallelSender {
                     }
                 }
             }
-            // Explicit flush at the end of this connection's work
-            sender.flush();
+            // Final flush. For QWP, wait for the server to acknowledge everything so the acked
+            // counter climbs to the full count during the drain (the real committed progress). The
+            // await loop drives the connection and refreshes the counter; capped to avoid a hang.
+            if (isQwp) {
+                final long finalSeq = sender.flushAndGetSequence();
+                fsnToRows.put(finalSeq, sent);
+                final long drainDeadline = System.nanoTime() + 600_000_000_000L; // 10 min cap
+                while (!sender.awaitAckedFsn(finalSeq, 200L) && System.nanoTime() < drainDeadline) {
+                    ACKED_ROWS[senderId].set(ackedRows(sender, fsnToRows));
+                }
+            } else {
+                sender.flush();
+            }
+            ACKED_ROWS[senderId].set(sent);
             System.out.printf("Sender %d finished sending %d events%n", senderId, sent);
         } catch (Exception e) {
             System.err.printf("Sender %d got error: %s%s%n", senderId, e.toString(), upgradeHint(e));
             throw new RuntimeException(e);
         }
+    }
+
+    // Rows the server has acknowledged for this sender: map the ack watermark (getAckedFsn) back to
+    // the cumulative row count recorded at the latest fully-acknowledged flush. Zero round-trips -
+    // the ack watermark rides the ingest connection.
+    private static long ackedRows(Sender sender, java.util.TreeMap<Long, Long> fsnToRows) {
+        final java.util.Map.Entry<Long, Long> e = fsnToRows.floorEntry(sender.getAckedFsn());
+        return e != null ? e.getValue() : 0L;
     }
 
     // Send the designated timestamp at NANOSECOND resolution. The client's at(Instant) path
