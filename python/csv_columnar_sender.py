@@ -55,8 +55,6 @@ import polars as pl
 
 from questdb.ingress import Client
 
-TABLE = "trades"
-
 
 def use_tls(args):
     return bool(args.tls or args.token or (args.username and args.password))
@@ -158,7 +156,7 @@ def run_worker(wid, events, base, args, counts):
                 add.append(pl.Series("timestamp", ts).cast(pl.Datetime("ns", "UTC")).alias("timestamp"))
             chunk = sl.with_columns(add)
 
-            client.dataframe(chunk, table_name=TABLE, symbols=["symbol", "side"], at="timestamp")
+            client.dataframe(chunk, table_name=args.destination_table, symbols=["symbol", "side"], at="timestamp")
 
             sent += n
             counts[wid] = sent
@@ -184,6 +182,8 @@ def main(argv):
     ap.add_argument("--rate", type=int, default=0,
                     help="target aggregate rows/second across ALL workers (0 = flat out)")
     ap.add_argument("--csv", default="../trades20250728.csv.gz")
+    ap.add_argument("--destination-table", default="trades",
+                    help="target table name (auto-created if absent); default 'trades'")
     ap.add_argument("--timestamp-from-file", action="store_true",
                     help="use the CSV timestamp column instead of a live 'now' stamp")
     # Enterprise auth / TLS
@@ -240,7 +240,7 @@ def main(argv):
             return 2
         print(f"[preflight] server reachable ({time.monotonic() - t0:.2f}s)")
 
-    print(f"Ingestion started (columnar QWP). base={base.height:,} rows, "
+    print(f"Ingestion started (columnar QWP). table={args.destination_table}, base={base.height:,} rows, "
           f"total={args.total_events:,}, workers={args.num_senders}, chunk-rows={args.chunk_rows:,}, "
           f"timestamps={'file' if args.timestamp_from_file else 'live-now'}, "
           f"pacing={'rate ' + str(args.rate) + ' rows/s' if args.rate else 'flat out'}")
