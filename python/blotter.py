@@ -1,25 +1,32 @@
 #!/usr/bin/env python3
 """A live blotter: poll a QuestDB table (or live view) N times/second and redraw in place.
 
-Builds `select * from TABLE [WHERE ...] limit N` from three params and refreshes a
-terminal table as fast as configured. Great for demoing live views.
+Runs `--query` verbatim, or builds `select * from TABLE [WHERE ...] limit N` from
+`--table`/`--where`/`--limit`, and refreshes a terminal table as fast as configured.
+Great for demoing live views.
 
-Params:
-  * table          - positional, the table / live view name.
-  * --where COND   - optional filter. If the first word (left-trimmed) is not "where",
-                     "WHERE " is prepended; otherwise it is used verbatim. Trailing clauses
-                     like ORDER BY just ride along (e.g. --where "symbol='EURUSD' order by timestamp").
-                     NOT sanitised - demo use only.
-  * --limit N      - default -10 (last 10 rows). Clamped to +/-100. |N| rows are shown.
+Params (provide --table OR --query):
+  * --table NAME   - table / live view name; a `select * from NAME [WHERE ...] limit N` is built.
+  * --query SQL    - full SQL run verbatim (CTEs, window functions, etc.). When set,
+                     --table/--where/--limit are ignored. A trailing ';' is stripped.
+  * --where COND   - optional filter (table mode). If the first word (left-trimmed) is not
+                     "where", "WHERE " is prepended; otherwise used verbatim. Trailing clauses
+                     like ORDER BY ride along. NOT sanitised - demo use only.
+  * --limit N      - table mode, default -10 (last 10 rows). Clamped to +/-100.
 
+At most 100 rows are displayed (the query/limit governs how many are fetched).
 Refresh rate: --rate Hz, default 5, clamped to 20.
 
 Auth / TLS (Enterprise): --token or --username/--password (turns on TLS); --tls forces TLS
-with no auth; --tls-verify unsafe_off for self-signed certs.
+with no auth; --tls-verify unsafe_off for self-signed certs; --token-file/--token-label to
+read the token from a file.
 
 Usage:
-    python blotter.py trades --where "symbol='BTC-USDT'" --limit -20 --rate 10 \
+    python blotter.py --table trades --where "symbol='BTC-USDT'" --limit -20 --rate 10 \
         [--addr host:9000] [--token TOK --tls-verify unsafe_off]
+    python blotter.py --query "with x as (select * from core_price_lv where symbol='EURUSD' \
+        order by timestamp desc limit 50) select *, avg(bid_price) over (partition by symbol) \
+        as avg50 from x" --addr host:9000 --token TOK --tls-verify unsafe_off
 
 Requires the QWP/egress build of the client (see README.md). Ctrl+C to quit.
 """
@@ -71,7 +78,9 @@ def draw(frame):
 
 def main(argv):
     ap = argparse.ArgumentParser(description="Live QuestDB blotter")
-    ap.add_argument("table", help="table or live view name")
+    ap.add_argument("--table", default=None, help="table or live view name (built into a select)")
+    ap.add_argument("--query", default=None,
+                    help="full SQL to run verbatim; when set, --table/--where/--limit are ignored")
     ap.add_argument("--where", default=None, help="filter condition ('WHERE' prepended if absent)")
     ap.add_argument("--limit", type=int, default=-10, help="row limit, default -10, clamped to +/-100")
     ap.add_argument("--rate", type=float, default=5.0, help="refreshes per second, default 5, max 20")
@@ -114,13 +123,6 @@ def main(argv):
         else:
             args.token = content.strip()
 
-    # Clamp limit magnitude to 100 (keep sign) and rate to 20 Hz.
-    if abs(args.limit) > 100:
-        args.limit = 100 if args.limit > 0 else -100
-        print(f"[warn] --limit clamped to {args.limit}", file=sys.stderr)
-    if args.limit == 0:
-        print("--limit must be non-zero", file=sys.stderr)
-        return 2
     if args.rate <= 0:
         print("--rate must be > 0", file=sys.stderr)
         return 2
@@ -128,9 +130,23 @@ def main(argv):
         args.rate = 20.0
         print("[warn] --rate clamped to 20 Hz", file=sys.stderr)
 
+    # A full --query runs verbatim (--table/--where/--limit ignored); otherwise build from --table.
+    if args.query and args.query.strip():
+        sql = args.query.strip().rstrip(";").strip()
+    elif args.table:
+        if abs(args.limit) > 100:
+            args.limit = 100 if args.limit > 0 else -100
+            print(f"[warn] --limit clamped to {args.limit}", file=sys.stderr)
+        if args.limit == 0:
+            print("--limit must be non-zero", file=sys.stderr)
+            return 2
+        sql = build_sql(args.table, args.where, args.limit)
+    else:
+        print("provide --table or --query", file=sys.stderr)
+        return 2
+
     conf = build_conf(args)
-    sql = build_sql(args.table, args.where, args.limit)
-    rows = abs(args.limit)
+    sql_line = " ".join(sql.split())   # collapse newlines/whitespace for the one-line header
     interval = 1.0 / args.rate
     scheme = "wss" if use_tls(args) else "ws"
 
@@ -139,14 +155,14 @@ def main(argv):
         try:
             df = client.query(sql).to_polars()
             ms = (time.perf_counter() - t0) * 1000.0
-            with pl.Config(tbl_rows=rows, tbl_cols=-1, tbl_hide_dataframe_shape=True):
+            with pl.Config(tbl_rows=min(df.height, 100), tbl_cols=-1, tbl_hide_dataframe_shape=True):
                 body = str(df)
             status = (f"{df.height} rows | q={ms:5.1f} ms | {args.rate:g} Hz | "
                       f"{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC")
         except Exception as e:  # noqa: BLE001
             body = f"[error] {e}"
             status = f"query failed | {datetime.now(timezone.utc):%H:%M:%S} UTC"
-        return f"SQL: {sql}\n     {status}\n{body}"
+        return f"SQL: {sql_line}\n     {status}\n{body}"
 
     if args.once:
         with Client.from_conf(conf) as client:
