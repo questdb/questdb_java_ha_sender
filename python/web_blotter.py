@@ -193,6 +193,8 @@ def main(argv):
                 .replace("__INTERVAL__", str(interval_ms)))
 
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"   # keep-alive: reuse one TCP connection across polls
+
         def log_message(self, *a):
             pass
 
@@ -220,7 +222,11 @@ def main(argv):
             else:
                 self._send(404, "text/plain", "not found")
 
-    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    class Server(ThreadingHTTPServer):
+        daemon_threads = True        # Ctrl+C exits immediately, even with a request in flight
+        allow_reuse_address = True
+
+    httpd = Server((args.host, args.port), Handler)
     shown = "localhost" if args.host in ("127.0.0.1", "localhost") else "<this-host>"
     print(f"[web-blotter] serving on {args.host}:{args.port}  ->  open http://{shown}:{args.port}/  "
           f"(Ctrl+C to quit)")
