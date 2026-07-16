@@ -69,11 +69,22 @@ def build_sql(table, where, limit):
 
 
 def draw(frame):
-    """Redraw in place: home the cursor, clear each line to its end as we write, then clear
-    anything left below (so a shorter frame does not leave stale rows)."""
+    """Redraw in place, writing ONLY the lines that changed since the last frame (diff render).
+    Over SSH the terminal repaint is the bottleneck, so skipping unchanged lines (borders,
+    header, static rows) is what lets the refresh rate go up. Each changed line is positioned
+    absolutely, rewritten, then cleared to end-of-line (to erase any longer previous content)."""
+    prev = getattr(draw, "_prev", [])
     lines = frame.split("\n")
-    sys.stdout.write("\033[H" + "\033[K\n".join(lines) + "\033[K\033[0J")
-    sys.stdout.flush()
+    out = []
+    for i in range(max(len(lines), len(prev))):
+        new = lines[i] if i < len(lines) else ""
+        old = prev[i] if i < len(prev) else None
+        if new != old:
+            out.append(f"\033[{i + 1};1H{new}\033[K")   # move to row, write, clear tail
+    if out:
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+    draw._prev = lines
 
 
 def main(argv):
