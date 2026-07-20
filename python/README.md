@@ -5,8 +5,12 @@ It replays a CSV of trades in a loop across N worker threads over QuestDB's QWP
 (WebSocket/UDP) and ILP/HTTP transports, with a probe that reads back the latest ingested
 timestamp and the serving node's live role.
 
-Built on the QuestDB Python client (`questdb.ingress`), which wraps the same C/Rust client
-as the other ports.
+Built on the QuestDB Python client **5.0**, which wraps the same C/Rust client as the
+other ports. The 5.0 shape: `questdb.connect()` returns one pooled `QuestDB` handle that
+queries, bulk-loads DataFrames and lends row senders; `questdb.Sender` is the standalone
+connection-level API for point-to-point ILP/HTTP, ILP/TCP and QWP/UDP. (The old
+`from questdb.ingress import Client` split is gone; `questdb.ingress` still imports as a
+deprecated 4.x shim.)
 
 ## Which script to use
 
@@ -14,15 +18,15 @@ This port has grown a few scripts. Pick by what you need:
 
 | Script | Use it for | Path / speed |
 | --- | --- | --- |
-| `csv_columnar_sender.py` | **High-throughput ingestion** - bulk CSV replay at volume | Columnar QWP (`Client.dataframe`, Arrow/polars). Fastest Python path; flat memory. |
+| `csv_columnar_sender.py` | **High-throughput ingestion** - bulk CSV replay at volume | Columnar QWP (`db.dataframe`, Arrow/polars). Fastest Python path; flat memory. |
 | `csv_parallel_sender.py` | **HA / failover demos** - store-and-forward durability, the live probe, `qwpudp`/`ilp` comparison, and the per-event `row()` API | Row-by-row QWP/UDP/ILP. Correct but slow for volume - keep `--total-events` and the batch window small. |
 | `read_bench.py` | Measuring read/scan throughput (rows/s) of a table | Streaming `iter_arrow()` egress. |
 | `enrich_polars_demo.py` | Read a table as polars, enrich, write it back as polars | Streaming read + columnar write. |
-| `dataframe_demo.py` | pandas/polars ingestion + egress round-trip showcase | `Sender.dataframe` / `Client.dataframe`. |
+| `dataframe_demo.py` | pandas/polars ingestion + egress round-trip showcase | `db.dataframe` (pandas + polars), `db.execute`, dual egress. |
 
 **Row-by-row vs columnar.** `sender.row()` in a Python loop is the *slowest* path: every cell
 crosses the Python/Cython boundary under the GIL (the client's own perf notes call it "~16x
-slower" than the columnar bulk path). `Client.dataframe` ships whole Arrow columns to the
+slower" than the columnar bulk path). `db.dataframe` ships whole Arrow columns to the
 native client - the only Python path that reaches Java/Rust-class throughput. So use
 `csv_columnar_sender.py` for volume, and reach for `csv_parallel_sender.py` **only** when you
 need store-and-forward failover, which the columnar path deliberately bypasses (dataframe
@@ -56,22 +60,23 @@ buffers, does ~52 MB/s). Two levers:
 
 ## Important: the client must be built from source
 
-The QWP transports (`qwpws`/`qwpwss`/`qwpudp`) **and the query client / egress reader are not
-in the PyPI release** (`questdb` 4.x on PyPI is ILP-only: `Protocol` has just
-`Tcp/Tcps/Http/Https`, and there is no `Client`/`QueryResult`). They live on the
-**`sm_qwp_dataframe_bench`** branch of
+Client **5.0.0** is unreleased, so it is not on PyPI yet (`questdb` 4.x on PyPI is ILP-only:
+`Protocol` has just `Tcp/Tcps/Http/Https`, no `QuestDB`/`connect`/`QueryResult`). The QWP
+transports (`ws`/`wss`/`udp`), the `questdb.connect()` query/ingest handle and the egress
+reader live on the **`jh_experiment_new_ilp`** branch of
 [`py-questdb-client`](https://github.com/questdb/py-questdb-client), which bumps the bundled
 C client to the QWP + egress build. You must build that branch.
 
-Requirements: **Python ≥ 3.10** (the branch is 3.10+; the PyPI-era 3.9 venv will not work),
-a Rust toolchain (`cargo`), and a C compiler. Build steps (a git worktree keeps your
-`main` checkout untouched):
+Requirements: **Python 3.12 or 3.13** (3.10+ works, but avoid CPython **3.14 + PyArrow 25.x**,
+which segfaults on a threaded worker-first Arrow allocation - an upstream PyArrow/3.14 bug, not
+the client; stay on a stable PyArrow 23.x/24.x), a Rust toolchain (`cargo`), and a C compiler.
+Build steps (a git worktree keeps your `main` checkout untouched):
 
 ```bash
 cd ~/prj/python/py-questdb-client
-git worktree add --detach /tmp/pyqdb_qwp origin/sm_qwp_dataframe_bench
-cd /tmp/pyqdb_qwp
-git submodule update --init          # bundled c-questdb-client (QWP + egress)
+git worktree add --detach /tmp/pyqdb_v5 origin/jh_experiment_new_ilp
+cd /tmp/pyqdb_v5
+git submodule update --init --recursive   # bundled c-questdb-client (QWP + egress)
 
 python3.12 -m venv /tmp/pyqdb_venv
 /tmp/pyqdb_venv/bin/pip install -U pip "cython>=3.1.2" "setuptools>=80.9.0" numpy pandas polars pyarrow
@@ -81,9 +86,12 @@ python3.12 -m venv /tmp/pyqdb_venv
 Verify:
 
 ```python
-from questdb.ingress import Protocol, Client   # Client only exists on the QWP build
+import questdb
+from questdb import Protocol, QuestDB          # top-level in 5.0 (was questdb.ingress.Client)
+print(questdb.__version__, hasattr(questdb, 'connect'))
+# -> 5.0.0 True
 print([p for p in dir(Protocol) if not p.startswith('_')])
-# -> ['Http', 'Https', 'QwpUdp', 'QwpWs', 'QwpWss', 'Tcp', 'Tcps']
+# -> ['Http', 'Https', 'Tcp', 'Tcps', 'Udp', 'Ws', 'Wss']
 ```
 
 Then run the scripts with that interpreter (`/tmp/pyqdb_venv/bin/python`). `pandas`, `polars`,
@@ -142,12 +150,13 @@ and would otherwise drop the last three digits of a `TIMESTAMP_NS` source).
 
 ## Probe (QWP/WebSocket only)
 
-For `qwp`, a background thread uses the pooled query client (`Client`) to run
+For `qwp`, a background thread uses a `questdb.connect()` query handle to run
 `select timestamp from trades limit -1` each interval and prints the latest ingested
 timestamp, then `switch status` for the serving node's live role. `switch status` is
 Enterprise-only (needs SYSTEM ADMIN); on OSS the probe prints
-`(live 'switch status' unavailable, ...)`. The client uses `target=any` (replica-fallback
-reads) and fails over across the `--addrs` hosts.
+`(live 'switch status' unavailable, ...)`. The handle uses `target=any` (replica-fallback
+reads) and fails over across the `--addrs` hosts. (5.0 also exposes `db.server_info()` for the
+handshake role/epoch/capabilities, should a probe want the role without `switch status`.)
 
 ## Dataframe demo (pandas / polars ingestion + egress)
 
@@ -157,35 +166,43 @@ reads) and fails over across the `--addrs` hosts.
 /tmp/pyqdb_venv/bin/python dataframe_demo.py --addr localhost:9000 --csv ../trades20250728.csv.gz --rows 5000
 ```
 
-- **pandas ingestion** via `Sender.dataframe(df, ...)` — the numpy-backed pandas planner.
-- **polars ingestion** via `Client.dataframe(df, ...)` — the pooled QWP Arrow-columnar path,
-  which takes polars / pyarrow / any Arrow C Stream source natively. (Numpy-backed pandas is
-  **not** accepted by `Client.dataframe` — it raises `UnsupportedDataFrameShapeError` — so
-  pandas goes through `Sender.dataframe`, or convert with `pyarrow.Table.from_pandas`.)
-- **egress** via `Client.query(sql).to_pandas()` and `.to_polars()` (also `.to_arrow()` /
+- **DDL** via `db.execute(sql)` — run-and-drain (drops the table), no HTTP `/exec` side channel.
+- **pandas ingestion** via `db.dataframe(df, ...)` — numpy-backed pandas is accepted directly on
+  the columnar handle (4.x's `Client.dataframe` rejected it). One caveat, exercised by the demo:
+  columnar v1 wants SYMBOL columns as pandas `Categorical` (or `string[pyarrow]`); plain `object`
+  strings land as VARCHAR, and forcing them to SYMBOL raises a now-per-column
+  `UnsupportedDataFrameShapeError`. The demo casts `symbol`/`side` to `category`.
+- **polars ingestion** via `db.dataframe(df, ...)` — the same call takes polars / pyarrow / any
+  Arrow C Stream source natively.
+- **egress** via `db.query(sql).to_pandas()` and `.to_polars()` (also `.to_arrow()` /
   `iter_pandas()`; the result exposes the Arrow PyCapsule interface for zero-copy consumers).
 
 ## Differences from the Java/Rust ports
 
 - **The client is pre-release / build-from-source** (see above) — not `pip install questdb`.
-- **Ingestion and querying are split across two classes**: `Sender` (ingest) and `Client`
-  (pooled QWP: query + Arrow-columnar dataframe ingest). The probe uses `Client`.
-- **Auto-flush exists** in the Python client (unlike the Rust client) and is verified to work
-  over QWP (row-threshold flush fires mid-stream; see Validated). This port sets
-  `auto_flush=off` and flushes at the same batch boundaries as the Java/Rust ports for
-  identical cadence.
-- **Config-string scheme is `qwpws`/`qwpwss` for both the sender and the query client.**
-  `qwpws`/`qwpwss` are the deprecated aliases (the Rust/C++ ports and their readers use the
-  newer `ws`/`wss`), but the Python binding's `Protocol` enum only exposes `QwpWs`/`QwpWss`, so
-  `ws`/`wss` are rejected here (`ValueError: Invalid value for Protocol`). Python must stay on
-  `qwpws`/`qwpwss` until the binding adds the `ws`/`wss` aliases.
-- **The probe has no handshake-role fallback** — because the Python binding does not expose it.
-  Java/Rust fall back to the QWP handshake role when `switch status` is unavailable. That role
-  exists in the underlying C client (`line_reader_server_info_role`/`_role_byte`) and the Rust
-  reader (`server_info()`), but the Python `Client` on this branch does not wrap it, so this
-  port prints "unavailable" on OSS. Likewise the query path's `on_failover_reset` callback is
-  wired internally in Cython but not surfaced to Python, so there is no user-facing failover
-  narration.
+- **One handle for QWP, plus a standalone `Sender`.** `questdb.connect()` returns a pooled
+  `QuestDB` handle that queries (`db.query`), runs DDL (`db.execute`), bulk-loads DataFrames
+  (`db.dataframe`) and lends row senders (`db.sender()`). The columnar scripts and the probe use
+  that handle. The row-by-row HA sender keeps a standalone `questdb.Sender` **per worker** —
+  each with its own `sender_id` and `sf_dir` for independent store-and-forward — which the shared
+  pool would not give.
+- **Auto-flush exists** on the standalone `Sender` (unlike the Rust client) and is verified over
+  QWP (row-threshold flush fires mid-stream; see Validated). This port sets `auto_flush=off` and
+  flushes at the same batch boundaries as the Java/Rust ports. (The **pooled** `db.sender()` has
+  no auto-flush by default — flushing there is always explicit.)
+- **Config-string scheme is `ws`/`wss` (and `udp`)**, matching the Rust/C ports — the 5.0 binding
+  renamed the Python-only `qwpws`/`qwpwss`/`qwpudp` away, so a conf string now copies verbatim
+  between clients. (`--protocol qwp`/`qwpudp`/`ilp` are just this port's transport selectors; they
+  map to `ws`/`udp`/`http` on the wire.)
+- **Naive `datetime` is UTC everywhere** in 5.0 (4.x read naive *scalars* in the machine's local
+  zone). These scripts already pass tz-aware `datetime.now(timezone.utc)` / integer nanos, so the
+  change is a no-op here — but a naive value now emits a one-per-process `UserWarning`.
+- **The probe still has no handshake-role fallback** — it prints "unavailable" on OSS when
+  `switch status` is missing. 5.0 *does* wrap the handshake role as `db.server_info().role`
+  (`ServerInfo`: role/epoch/capabilities/cluster/node/zone), so a fallback is now possible; this
+  port has not wired it in. Connection narration is also available now via the `connection_listener=`
+  callback on `connect()`/`Sender` (`ConnectionEvent`s: connected/disconnected/reconnected/failed_over/...),
+  which this port does not use.
 - Threads (like Java/Rust). Python's GIL is released during client I/O, but row-building is
   Python-level, so row-by-row throughput is well below Java/Rust — use the dataframe path
   for volume.

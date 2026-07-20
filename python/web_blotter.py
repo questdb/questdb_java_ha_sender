@@ -16,7 +16,7 @@ poll rate. Open the printed URL. Ctrl+C to quit.
         --addr host:9000 --token-file ~/prj/python/ent_tokens.txt --token-label disaster \
         --tls-verify unsafe_off [--port 8080]
 
-Requires the QWP/egress build of the client (see README.md).
+Requires the questdb 5.0 client (see README.md).
 """
 
 import argparse
@@ -27,7 +27,7 @@ import threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from questdb.ingress import Client
+import questdb
 
 
 def use_tls(args):
@@ -35,7 +35,7 @@ def use_tls(args):
 
 
 def build_conf(args):
-    scheme = "qwpwss" if use_tls(args) else "qwpws"
+    scheme = "wss" if use_tls(args) else "ws"
     parts = [f"{scheme}::addr={args.addr};"]
     if args.token:
         parts.append(f"token={args.token};")
@@ -186,7 +186,7 @@ def main(argv):
     interval_ms = max(50, int(1000 / max(0.1, args.rate)))
 
     conf = build_conf(args)
-    client = Client.from_conf(conf)
+    db = questdb.connect(conf)
     lock = threading.Lock()
     page = (HTML.replace("__TITLE__", f"blotter: {args.table or 'query'}")
                 .replace("__SQL__", " ".join(sql.split()))
@@ -215,7 +215,7 @@ def main(argv):
             elif self.path.startswith("/data"):
                 try:
                     with lock:
-                        df = client.query(sql).to_polars()
+                        df = db.query(sql).to_polars()
                     self._send(200, "application/json", json.dumps(df_to_payload(df)))
                 except Exception as e:  # noqa: BLE001
                     self._send(200, "application/json", json.dumps({"error": str(e)}))
@@ -240,7 +240,7 @@ def main(argv):
         pass
     finally:
         httpd.server_close()
-        client.close()
+        db.close()
     return 0
 
 

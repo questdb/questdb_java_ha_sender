@@ -13,7 +13,7 @@ Example (the default 500M rows/day over ~1.54 days is ~771M rows):
     python backfill.py --addr host:9000 --num-senders 4 \
         --token "$QDB_TOKEN" --tls-verify unsafe_off
 
-Requires the QWP/egress build of the client (see README.md).
+Requires the questdb 5.0 client (see README.md).
 """
 
 import argparse
@@ -27,7 +27,7 @@ from datetime import datetime, timezone, timedelta
 import numpy as np
 import polars as pl
 
-from questdb.ingress import Client
+import questdb
 
 NS_PER_DAY = 86_400_000_000_000
 
@@ -36,14 +36,8 @@ def use_tls(args):
     return bool(args.tls or args.token or (args.username and args.password))
 
 
-def display_scheme(args):
-    return "wss" if use_tls(args) else "ws"
-
-
 def build_conf(args):
-    # Python's binding requires the qwpws/qwpwss scheme (it rejects ws/wss); only the printed
-    # [conf] line shows wss/ws, via display_scheme().
-    scheme = "qwpwss" if use_tls(args) else "qwpws"
+    scheme = "wss" if use_tls(args) else "ws"
     parts = [f"{scheme}::addr={args.addr};"]
     if args.token:
         parts.append(f"token={args.token};")
@@ -84,7 +78,7 @@ def run_worker(wid, start_index, count, deck, args, start_ns, step_ns, counts):
     conf = build_conf(args)
     sent = 0
     pos = start_index % m
-    with Client.from_conf(conf) as client:
+    with questdb.connect(conf) as db:
         while sent < count:
             cn = min(args.chunk_rows, count - sent, m - pos)
             sl = deck.slice(pos, cn)                       # zero-copy view into the deck
@@ -94,7 +88,7 @@ def run_worker(wid, start_index, count, deck, args, start_ns, step_ns, counts):
                 pl.Series("timestamp", ts).cast(pl.Datetime("ns", "UTC")),
                 (pl.lit("backfill-") + pl.int_range(gidx, gidx + cn).cast(pl.Utf8)).alias("trade_id"),
             )
-            client.dataframe(chunk, table_name=args.table, symbols=["symbol", "side"], at="timestamp")
+            db.dataframe(chunk, table_name=args.table, symbols=["symbol", "side"], at="timestamp")
             sent += cn
             counts[wid] = sent
             pos = (pos + cn) % m
@@ -106,7 +100,7 @@ def preflight(conf, timeout_s):
 
     def probe():
         try:
-            with Client.from_conf(conf) as c:
+            with questdb.connect(conf) as c:
                 c.query("select 1").to_polars()
             outcome["ok"] = True
         except Exception as e:  # noqa: BLE001
@@ -175,7 +169,7 @@ def main(argv):
         return 2
 
     span_days = (end_ns - start_ns) / NS_PER_DAY
-    print(f"[conf]   {display_scheme(args)} tls={use_tls(args)} "
+    print(f"[conf]   {'wss' if use_tls(args) else 'ws'} tls={use_tls(args)} "
           f"auth={'token' if args.token else 'basic' if args.username else 'none'} | addrs: {args.addr}")
     print(f"[backfill] window {start.isoformat()} .. {end.isoformat()} ({span_days:.2f} days) @ "
           f"{args.rate_per_day:,.0f} rows/day -> {n:,} rows, one every {step_ns / 1000:.1f} us, "

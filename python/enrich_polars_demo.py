@@ -6,26 +6,27 @@ materializing the whole result set, it streams the read in Arrow record batches
 and ingests each enriched batch before pulling the next, so peak memory is one
 batch (not all ``--limit`` rows):
 
-  * READ  - ``Client.query(sql).iter_arrow()`` yields ``pyarrow.RecordBatch`` chunks
+  * READ  - ``db.query(sql).iter_arrow()`` yields ``pyarrow.RecordBatch`` chunks
     one at a time from a server-side cursor (verified streaming in the client:
     ``iter_arrow`` pulls via ``line_reader_cursor_next_batch``; ``to_polars`` by
     contrast is "materialise-whole" and would buffer every row in RAM);
     ``pl.from_arrow(batch)`` wraps each into a polars DataFrame (zero-copy).
   * ENRICH - add an ``enriched_rnd`` column: a random ``A``-``Z`` value per row.
-  * WRITE - ``Client.dataframe(chunk, ...)`` ingests each polars chunk into
+  * WRITE - ``db.dataframe(chunk, ...)`` ingests each polars chunk into
     ``enriched_<table>_demo`` over the QWP Arrow-columnar path.
 
 Both the read and the write are polars DataFrames. No pandas in the round-trip.
-The read and the write use separate ``Client`` connections so the open read
-stream and the ingest never share a socket.
+A single ``questdb.connect()`` handle serves both: the open read stream holds one
+pooled connection while each write borrows a separate direct one, so the read cursor
+and the ingest never share a socket.
 
 Column typing is automatic: QuestDB SYMBOL columns come back as polars ``Categorical``
-and VARCHAR as ``String``, and ``Client.dataframe``'s default ``symbols='auto'`` maps
+and VARCHAR as ``String``, and ``db.dataframe``'s default ``symbols='auto'`` maps
 ``Categorical -> SYMBOL`` and ``String -> VARCHAR`` on the way back in. ``enriched_rnd``
 is built as a ``Categorical`` so it too lands as a SYMBOL.
 
 Auth / TLS (QuestDB Enterprise): pass ``--token`` (bearer) or ``--username``/``--password``
-(basic). Either turns on TLS automatically (scheme ``qwpwss``); ``--tls`` forces TLS with
+(basic). Either turns on TLS automatically (scheme ``wss``); ``--tls`` forces TLS with
 no auth. Certificate verification is on by default; use ``--tls-verify unsafe_off`` for
 self-signed certs. The same credentials are applied to the HTTP ``/exec`` calls used for
 drop/verify.
@@ -39,7 +40,7 @@ Usage:
 By default the target table is dropped and recreated on each run; pass ``--keep``
 to append instead. ``--limit`` defaults to the latest 200 million rows by designated
 timestamp, streamed ascending so re-ingest stays in timestamp order. Requires the
-QWP/egress build of the client (see README.md).
+questdb 5.0 client (see README.md).
 """
 
 import argparse
@@ -54,7 +55,7 @@ import urllib.request
 import numpy as np
 import polars as pl
 
-from questdb.ingress import Client
+import questdb
 
 LETTERS = np.array(list("ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
 
@@ -64,8 +65,8 @@ def use_tls(args):
 
 
 def build_conf(args):
-    """QWP connect string for the reader/writer, with optional auth + TLS."""
-    scheme = "qwpwss" if use_tls(args) else "qwpws"
+    """QWP connect string for the handle, with optional auth + TLS."""
+    scheme = "wss" if use_tls(args) else "ws"
     parts = [f"{scheme}::addr={args.addr};"]
     if args.token:
         parts.append(f"token={args.token};")
@@ -131,7 +132,7 @@ def main(argv):
     ap.add_argument("--token", default=None, help="bearer token (turns on TLS)")
     ap.add_argument("--username", default=None, help="basic-auth username (turns on TLS)")
     ap.add_argument("--password", default=None, help="basic-auth password")
-    ap.add_argument("--tls", action="store_true", help="force TLS (qwpwss) with no auth")
+    ap.add_argument("--tls", action="store_true", help="force TLS (wss) with no auth")
     ap.add_argument("--tls-verify", choices=["on", "unsafe_off"], default="on",
                     help="certificate verification; use unsafe_off for self-signed")
     args = ap.parse_args(argv)
@@ -156,15 +157,17 @@ def main(argv):
 
     total = 0
     t0 = time.monotonic()
-    # Separate connections: the read stream stays open while each chunk is written.
-    with Client.from_conf(conf) as reader, Client.from_conf(conf) as writer:
-        result = reader.query(sql)
+    # One handle owns the pool: the open read stream holds one pooled connection while
+    # each db.dataframe() write borrows a separate direct columnar connection - so the
+    # read cursor and the ingest never share a socket, from a single QuestDB handle.
+    with questdb.connect(conf) as db:
+        result = db.query(sql)
         for i, batch in enumerate(result.iter_arrow()):
             chunk = pl.from_arrow(batch)          # RecordBatch -> polars, zero-copy
             if chunk.height == 0:
                 continue
             chunk = enrich(chunk, rng)
-            writer.dataframe(chunk, table_name=target, at=ts_col)
+            db.dataframe(chunk, table_name=target, at=ts_col)
             total += chunk.height
             print(f"[chunk {i}] {chunk.height:,} rows enriched + written "
                   f"(running total {total:,})")

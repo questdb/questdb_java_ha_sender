@@ -1,46 +1,44 @@
 #!/usr/bin/env python3
-"""Pandas and polars ingestion + egress round-trip over QWP/WebSocket.
+"""Pandas and polars ingestion + egress round-trip over one QuestDB 5.0 handle.
 
-Showcases the columnar/dataframe capabilities the row-by-row sender does not:
+Showcases the columnar/dataframe capabilities the row-by-row sender does not, all
+through a single ``questdb.connect()`` handle:
 
-  * pandas ingestion via ``Sender.dataframe`` (the numpy-backed pandas planner).
-  * polars ingestion via ``Client.dataframe`` (the pooled QWP Arrow-columnar path;
-    it takes polars / pyarrow / any Arrow C Stream source natively — numpy-backed
-    pandas is not accepted there, so pandas goes through ``Sender.dataframe``).
-  * egress via ``Client.query(...).to_pandas()`` and ``.to_polars()``.
+  * DDL via ``db.execute(sql)`` - run-and-drain, no HTTP ``/exec`` side channel.
+  * pandas ingestion via ``db.dataframe`` - numpy-backed pandas is accepted directly
+    (SYMBOL columns as pandas ``Categorical``); in 4.x the columnar ``Client.dataframe``
+    rejected numpy pandas outright and it had to go through ``Sender.dataframe``.
+  * polars ingestion via ``db.dataframe`` - the same call takes polars / pyarrow /
+    any Arrow C Stream source natively.
+  * egress via ``db.query(...).to_pandas()`` and ``.to_polars()``.
+
+One handle for DDL, ingest and query - the 5.0 shape. (The standalone ``Sender``
+and its ``Sender.dataframe`` still exist for point-to-point ILP/HTTP, ILP/TCP and
+QWP/UDP needs; over ``ws``/``wss`` they route to the same direct columnar path.)
 
 Usage:
     python dataframe_demo.py [--addr localhost:9000] [--csv ../trades20250728.csv.gz] [--rows 5000]
 
-Requires the QWP/egress build of the questdb client (see README.md).
+Requires the questdb 5.0 client (see README.md).
 """
 
 import argparse
 import sys
 import time
-import urllib.parse
-import urllib.request
 
 import pandas as pd
 import polars as pl
 
-from questdb.ingress import Sender, Client
+import questdb
 
 TABLE = "df_demo"
 
 
-def exec_sql(addr, sql):
-    """Run a statement over the HTTP /exec endpoint (same host, HTTP port)."""
-    url = f"http://{addr}/exec?" + urllib.parse.urlencode({"query": sql})
-    with urllib.request.urlopen(url, timeout=10) as resp:
-        resp.read()
-
-
-def wait_for_count(client, table, at_least, timeout_s=30):
+def wait_for_count(db, table, at_least, timeout_s=30):
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         try:
-            n = int(client.query(f"select count() from {table}").to_pandas().iloc[0, 0])
+            n = int(db.query(f"select count() from {table}").to_pandas().iloc[0, 0])
             if n >= at_least:
                 return n
         except Exception:
@@ -50,12 +48,14 @@ def wait_for_count(client, table, at_least, timeout_s=30):
 
 
 def load_pandas(csv_path, rows):
-    """Load the CSV into a pandas DataFrame with dtypes the ingestion path accepts
-    (object strings, float64, tz-aware nanosecond timestamps)."""
+    """Load the CSV into a numpy-backed pandas DataFrame the columnar handle ingests
+    directly: float64 values, tz-aware nanosecond timestamps, and the SYMBOL columns
+    as pandas ``Categorical`` (what ``db.dataframe``'s columnar v1 path wants for a
+    SYMBOL - plain ``object`` strings land as VARCHAR instead)."""
     raw = pd.read_csv(csv_path, nrows=rows)
     return pd.DataFrame({
-        "symbol": raw["symbol"].astype("object"),
-        "side": raw["side"].astype("object"),
+        "symbol": raw["symbol"].astype("category"),
+        "side": raw["side"].astype("category"),
         "price": raw["price"].astype("float64"),
         "amount": raw["amount"].astype("float64"),
         "timestamp": pd.to_datetime(raw["timestamp"], utc=True).dt.as_unit("ns"),
@@ -74,38 +74,36 @@ def main(argv):
     pldf = pl.from_pandas(pdf)
     print(f"built polars DataFrame: {pldf.height} rows\n")
 
-    exec_sql(args.addr, f"drop table if exists {TABLE}")
+    with questdb.connect(f"ws::addr={args.addr};") as db:
+        db.execute(f"drop table if exists {TABLE}")   # DDL, run-and-drain
 
-    # --- INGESTION ---
-    # pandas -> Sender.dataframe (numpy-backed pandas planner) over QWP/WebSocket.
-    with Sender.from_conf(f"qwpws::addr={args.addr};auto_flush=off;") as sender:
-        sender.dataframe(pdf, table_name=TABLE, symbols=["symbol", "side"], at="timestamp")
-        sender.flush()
-    print(f"[ingest] pandas via Sender.dataframe: {pdf.shape[0]} rows")
+        # --- INGESTION (both frames through the one handle) ---
+        # numpy-backed pandas - accepted directly in 5.0 (was rejected in 4.x).
+        db.dataframe(pdf, table_name=TABLE, symbols=["symbol", "side"], at="timestamp")
+        print(f"[ingest] pandas via db.dataframe: {pdf.shape[0]} rows")
 
-    with Client.from_conf(f"qwpws::addr={args.addr};") as client:
-        # polars -> Client.dataframe (Arrow-columnar path, polars is native).
-        client.dataframe(pldf, table_name=TABLE, symbols=["symbol", "side"], at="timestamp")
-        print(f"[ingest] polars via Client.dataframe: {pldf.height} rows")
+        # polars - the same call, Arrow-columnar and native.
+        db.dataframe(pldf, table_name=TABLE, symbols=["symbol", "side"], at="timestamp")
+        print(f"[ingest] polars via db.dataframe: {pldf.height} rows")
 
         expected = pdf.shape[0] + pldf.height
-        n = wait_for_count(client, TABLE, expected)
+        n = wait_for_count(db, TABLE, expected)
         print(f"[ingest] server applied {n} rows (expected {expected})\n")
 
         # --- EGRESS ---
-        pd_out = client.query(
+        pd_out = db.query(
             f"select symbol, count() n, round(avg(price), 2) avg_price "
             f"from {TABLE} order by n desc limit 5"
         ).to_pandas()
-        print("[egress] Client.query(...).to_pandas():")
+        print("[egress] db.query(...).to_pandas():")
         print(pd_out.to_string(index=False))
         print()
 
-        pl_out = client.query(
+        pl_out = db.query(
             f"select side, count() n, round(sum(amount), 4) total_amount "
             f"from {TABLE} group by side order by side"
         ).to_polars()
-        print("[egress] Client.query(...).to_polars():")
+        print("[egress] db.query(...).to_polars():")
         print(pl_out)
 
     return 0

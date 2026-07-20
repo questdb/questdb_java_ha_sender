@@ -2,18 +2,18 @@
 """Fast CSV replay sender for QuestDB - the COLUMNAR QWP path.
 
 This is the throughput-oriented Python sender. It replays a CSV to a QuestDB
-``trades`` table over the QWP WebSocket transport using the *column-major* client
-path (``Client.dataframe``), which ships whole Arrow columns to the native Rust
+``trades`` table over the QWP WebSocket transport using the *column-major* handle
+path (``db.dataframe``), which ships whole Arrow columns to the native Rust
 client in bulk. That is the ONLY Python path that gets near Java/Rust throughput.
 
-Why not row-by-row? ``Sender.row(...)`` in a Python loop is the SLOWEST path: every
+Why not row-by-row? ``sender.row(...)`` in a Python loop is the SLOWEST path: every
 cell crosses the Python/Cython boundary under the GIL. The client's own perf notes
 call the row API a "per-cell call ... ~16x slower" than the columnar bulk path.
-The column path (``Client.dataframe``) stores raw pointers into the Arrow buffers
+The column path (``db.dataframe``) stores raw pointers into the Arrow buffers
 ("no data copy at append time") and does one memcpy per column at flush. Use it.
 
 Memory stays flat: the CSV is loaded once into a polars DataFrame, and rows are
-sent in bounded, zero-copy slices. ``Client.dataframe`` additionally streams each
+sent in bounded, zero-copy slices. ``db.dataframe`` additionally streams each
 send internally at ``max_rows_per_batch`` (16384) rows, so nothing balloons - unlike
 the row-by-row sender, which buffered up to 100k rows before its first flush and
 grew without bound when Python could not reach that threshold fast enough.
@@ -24,7 +24,7 @@ Timestamps:
     so the target looks live and there is no out-of-order within a worker.
 
 Auth / TLS (QuestDB Enterprise): ``--token`` (bearer) or ``--username``/``--password``
-(basic) turn on TLS automatically (scheme ``qwpwss``); ``--tls`` forces TLS with no
+(basic) turn on TLS automatically (scheme ``wss``); ``--tls`` forces TLS with no
 auth. Certificate verification is on by default; ``--tls-verify unsafe_off`` for
 self-signed certs. Multiple ``--addrs`` give QWP failover.
 
@@ -39,7 +39,7 @@ Usage:
         [--timestamp-from-file] \
         [--token TOK | --username U --password P] [--tls-verify on|unsafe_off]
 
-Requires the QWP/egress build of the client (see README.md).
+Requires the questdb 5.0 client (see README.md).
 """
 
 import argparse
@@ -53,7 +53,7 @@ import time
 import numpy as np
 import polars as pl
 
-from questdb.ingress import Client
+import questdb
 
 
 def use_tls(args):
@@ -61,8 +61,8 @@ def use_tls(args):
 
 
 def build_conf(args):
-    """QWP connect string for the columnar client, with optional auth + TLS + failover."""
-    scheme = "qwpwss" if use_tls(args) else "qwpws"
+    """QWP connect string for the columnar handle, with optional auth + TLS + failover."""
+    scheme = "wss" if use_tls(args) else "ws"
     addrs = ",".join(a.strip() for a in args.addrs.split(",") if a.strip())
     parts = [f"{scheme}::addr={addrs};"]
     if args.token:
@@ -83,7 +83,7 @@ def preflight(conf, timeout_s):
 
     def probe():
         try:
-            with Client.from_conf(conf) as c:
+            with questdb.connect(conf) as c:
                 c.query("select 1").to_polars()
             outcome["ok"] = True
         except Exception as e:  # noqa: BLE001
@@ -129,7 +129,7 @@ def load_base(path, need_timestamp):
 def run_worker(wid, events, base, args, counts):
     """Send `events` rows for this worker: cycle over the base frame in bounded
     slices, attach trade_id (+ a live timestamp unless reading it from file), and
-    ship each slice columnar via Client.dataframe."""
+    ship each slice columnar via db.dataframe."""
     m = base.height
     from_file = args.timestamp_from_file
     conf = build_conf(args)
@@ -142,7 +142,7 @@ def run_worker(wid, events, base, args, counts):
     pos = 0
     last_ts = 0
     pace_start = time.perf_counter_ns()
-    with Client.from_conf(conf) as client:
+    with questdb.connect(conf) as db:
         while sent < events:
             n = min(args.chunk_rows, events - sent, m - pos)
             sl = base.slice(pos, n)  # zero-copy view into the base frame
@@ -156,7 +156,7 @@ def run_worker(wid, events, base, args, counts):
                 add.append(pl.Series("timestamp", ts).cast(pl.Datetime("ns", "UTC")).alias("timestamp"))
             chunk = sl.with_columns(add)
 
-            client.dataframe(chunk, table_name=args.destination_table, symbols=["symbol", "side"], at="timestamp")
+            db.dataframe(chunk, table_name=args.destination_table, symbols=["symbol", "side"], at="timestamp")
 
             sent += n
             counts[wid] = sent
@@ -178,7 +178,7 @@ def main(argv):
     ap.add_argument("--num-senders", type=int, default=1,
                     help="worker threads, each with its own columnar client")
     ap.add_argument("--chunk-rows", type=int, default=100_000,
-                    help="rows per Client.dataframe call (pacing granularity + peak-memory bound)")
+                    help="rows per db.dataframe call (pacing granularity + peak-memory bound)")
     ap.add_argument("--rate", type=int, default=0,
                     help="target aggregate rows/second across ALL workers (0 = flat out)")
     ap.add_argument("--csv", default="../trades20250728.csv.gz")
@@ -190,7 +190,7 @@ def main(argv):
     ap.add_argument("--token", default=None, help="bearer token (turns on TLS)")
     ap.add_argument("--username", default=None, help="basic-auth username (turns on TLS)")
     ap.add_argument("--password", default=None, help="basic-auth password")
-    ap.add_argument("--tls", action="store_true", help="force TLS (qwpwss) with no auth")
+    ap.add_argument("--tls", action="store_true", help="force TLS (wss) with no auth")
     ap.add_argument("--tls-verify", choices=["on", "unsafe_off"], default="on",
                     help="certificate verification; use unsafe_off for self-signed")
     ap.add_argument("--connect-timeout", type=float, default=10.0,

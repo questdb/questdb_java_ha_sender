@@ -7,7 +7,7 @@ volume handed to the reader, not the compressed QWP wire bytes (which the client
 not expose) - so it is a data-throughput figure, generally larger than the on-wire rate.
 
 Fastest path, by design: consume the QWP query cursor's Arrow batches directly
-(``Client.query(sql).iter_arrow()``) and just tally ``batch.num_rows``. No pandas
+(``db.query(sql).iter_arrow()``) and just tally ``batch.num_rows``. No pandas
 or polars conversion - the Rust client already decodes the wire into Arrow inside
 ``iter_arrow`` (that decode is the unavoidable "read" work, done in native code),
 so the Python loop does nothing but add row counts. Converting each batch to
@@ -23,7 +23,7 @@ timestamp slice) and reports the aggregate rows/sec, which is the way past the
 per-connection wall. ``--readers 1`` (default) is the plain single stream.
 
 Auth / TLS (QuestDB Enterprise): pass ``--token`` (bearer) or ``--username``/``--password``
-(basic). Either turns on TLS automatically (scheme ``qwpwss``); ``--tls`` forces TLS with
+(basic). Either turns on TLS automatically (scheme ``wss``); ``--tls`` forces TLS with
 no auth. Certificate verification is on by default; use ``--tls-verify unsafe_off`` for
 self-signed certs.
 
@@ -32,7 +32,7 @@ Usage:
         [--addr host:9000] [--limit 10000000] [--readers 1] \
         [--token TOK | --username U --password P] [--tls] [--tls-verify on|unsafe_off]
 
-Requires the QWP/egress build of the client (see README.md).
+Requires the questdb 5.0 client (see README.md).
 """
 
 import argparse
@@ -41,7 +41,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from questdb.ingress import Client
+import questdb
 
 
 def use_tls(args):
@@ -50,7 +50,7 @@ def use_tls(args):
 
 def build_conf(args):
     """QWP connect string for the reader(s), with optional auth + TLS."""
-    scheme = "qwpwss" if use_tls(args) else "qwpws"
+    scheme = "wss" if use_tls(args) else "ws"
     parts = [f"{scheme}::addr={args.addr};"]
     if args.token:
         parts.append(f"token={args.token};")
@@ -76,8 +76,8 @@ def split_queries(args, conf):
     if readers <= 1:
         return [f"select * from {table} limit -{limit}"]
     # Range of the latest `limit` rows, as epoch nanoseconds.
-    with Client.from_conf(conf) as c:
-        mm = c.query(
+    with questdb.connect(conf) as db:
+        mm = db.query(
             f"select min({ts}) lo, max({ts}) hi "
             f"from (select {ts} from {table} limit -{limit})"
         ).to_polars()
@@ -102,8 +102,8 @@ def split_queries(args, conf):
 
 def run_reader(idx, sql, conf, counts, byts, errors, sample_n, sample_out):
     try:
-        with Client.from_conf(conf) as client:
-            result = client.query(sql)
+        with questdb.connect(conf) as db:
+            result = db.query(sql)
             n = 0
             b = 0
             for batch in result.iter_arrow():
@@ -140,7 +140,7 @@ def main(argv):
     ap.add_argument("--token", default=None, help="bearer token (turns on TLS)")
     ap.add_argument("--username", default=None, help="basic-auth username (turns on TLS)")
     ap.add_argument("--password", default=None, help="basic-auth password")
-    ap.add_argument("--tls", action="store_true", help="force TLS (qwpwss) with no auth")
+    ap.add_argument("--tls", action="store_true", help="force TLS (wss) with no auth")
     ap.add_argument("--tls-verify", choices=["on", "unsafe_off"], default="on",
                     help="certificate verification; use unsafe_off for self-signed")
     args = ap.parse_args(argv)

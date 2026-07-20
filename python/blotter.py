@@ -28,7 +28,7 @@ Usage:
         order by timestamp desc limit 50) select *, avg(bid_price) over (partition by symbol) \
         as avg50 from x" --addr host:9000 --token TOK --tls-verify unsafe_off
 
-Requires the QWP/egress build of the client (see README.md). Ctrl+C to quit.
+Requires the questdb 5.0 client (see README.md). Ctrl+C to quit.
 """
 
 import argparse
@@ -39,7 +39,7 @@ from datetime import datetime, timezone
 
 import polars as pl
 
-from questdb.ingress import Client
+import questdb
 
 
 def use_tls(args):
@@ -47,7 +47,7 @@ def use_tls(args):
 
 
 def build_conf(args):
-    scheme = "qwpwss" if use_tls(args) else "qwpws"   # Python requires the qwp* scheme
+    scheme = "wss" if use_tls(args) else "ws"
     parts = [f"{scheme}::addr={args.addr};"]
     if args.token:
         parts.append(f"token={args.token};")
@@ -161,10 +161,10 @@ def main(argv):
     interval = 1.0 / args.rate
     scheme = "wss" if use_tls(args) else "ws"
 
-    def render(client):
+    def render(db):
         t0 = time.perf_counter()
         try:
-            df = client.query(sql).to_polars()
+            df = db.query(sql).to_polars()
             ms = (time.perf_counter() - t0) * 1000.0
             with pl.Config(tbl_rows=min(df.height, 100), tbl_cols=-1, tbl_hide_dataframe_shape=True):
                 body = str(df)
@@ -176,17 +176,17 @@ def main(argv):
         return f"SQL: {sql_line}\n     {status}\n{body}"
 
     if args.once:
-        with Client.from_conf(conf) as client:
+        with questdb.connect(conf) as db:
             print(f"[conf]   {scheme} tls={use_tls(args)} | addr: {args.addr}")
-            print(render(client))
+            print(render(db))
         return 0
 
     sys.stdout.write("\033[2J\033[?25l")  # clear once, hide cursor
     try:
-        with Client.from_conf(conf) as client:
+        with questdb.connect(conf) as db:
             while True:
                 t0 = time.perf_counter()
-                draw(render(client))
+                draw(render(db))
                 time.sleep(max(0.0, interval - (time.perf_counter() - t0)))
     except KeyboardInterrupt:
         pass

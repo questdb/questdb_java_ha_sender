@@ -4,16 +4,17 @@
 Replays a CSV of trades in a loop across N worker threads over one of three transports
 (``--protocol``):
 
-  * ``qwp``    - QWP over WebSocket: store-and-forward (un-acked frames spill to disk and
-                 replay after an outage), transactional commit, multi-host failover. A
-                 background probe polls the latest ingested timestamp and the serving
-                 node's live role over a QWP query client (``Client``).
-  * ``qwpudp`` - QWP over UDP: fire-and-forget datagrams to :9007. Ingest-only,
+  * ``qwp``    - QWP over WebSocket (``ws``/``wss``): store-and-forward (un-acked frames
+                 spill to disk and replay after an outage), transactional commit,
+                 multi-host failover. A background probe polls the latest ingested
+                 timestamp and the serving node's live role over a ``questdb.connect()``
+                 query handle.
+  * ``qwpudp`` - QWP over UDP (``udp``): fire-and-forget datagrams to :9007. Ingest-only,
                  unauthenticated, single-endpoint, best-effort (no ack, no failover).
   * ``ilp``    - the legacy ILP/HTTP transport.
 
-Requires the QWP/egress build of the questdb Python client (see README.md); the PyPI
-release does not expose QWP or the query client.
+Requires the questdb 5.0 client (see README.md); the current PyPI release does not
+expose QWP or the query handle.
 """
 
 import argparse
@@ -25,7 +26,8 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from questdb.ingress import Sender, Client, TimestampNanos, ServerTimestamp
+import questdb
+from questdb import Sender, TimestampNanos, ServerTimestamp
 
 PROBE_QUERY = "select timestamp from trades limit -1"
 # Enterprise lifecycle status of whichever node the query client is connected to. Returns
@@ -92,7 +94,7 @@ def build_ingest_conf(args, worker_id):
     """Ingestion connect string for the configured transport (same keys as the Rust port)."""
     addrs = addr_list(args)
     if args.protocol == "qwpudp":
-        return f"qwpudp::addr={addrs[0]};auto_flush=off;"
+        return f"udp::addr={addrs[0]};auto_flush=off;"
 
     if args.protocol == "ilp":
         scheme = "https" if tls(args) else "http"
@@ -104,7 +106,7 @@ def build_ingest_conf(args, worker_id):
         return "".join(parts)
 
     # qwp (WebSocket)
-    scheme = "qwpwss" if tls(args) else "qwpws"
+    scheme = "wss" if tls(args) else "ws"
     who = f"{args.sender_id}-{worker_id}"
     sf = os.path.join(args.store_forward_dir, who)
     os.makedirs(sf, exist_ok=True)
@@ -126,7 +128,7 @@ def build_client_conf(args):
     """Connect string for the QWP query client (probe): target=any (replica-fallback
     reads), failover on, zone bias. Same hosts/auth as the senders."""
     addrs = addr_list(args)
-    scheme = "qwpwss" if tls(args) else "qwpws"
+    scheme = "wss" if tls(args) else "ws"
     parts = [f"{scheme}::addr={','.join(addrs)};", "target=any;", "failover=true;"]
     _append_auth(parts, args)
     if tls(args):
@@ -275,7 +277,7 @@ def _switch_status_roles(client):
 def run_probe(args, stop):
     conf = build_client_conf(args)
     try:
-        client = Client.from_conf(conf)
+        client = questdb.connect(conf)
     except Exception as e:
         print(f"[query client] connect failed: {e}")
         return
