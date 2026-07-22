@@ -83,6 +83,22 @@ python3.12 -m venv /tmp/pyqdb_venv
 /tmp/pyqdb_venv/bin/pip install -e .   # compiles Cython + the Rust FFI
 ```
 
+**Self-signed certs / `tls_verify=unsafe_off`.** 5.0 keeps the `insecure-skip-verify`
+Cargo feature **out of the default build** (disabling cert verification is a footgun that
+must never ship in a wheel). If you connect over `wss` to a server with a self-signed cert
+and use `--tls-verify unsafe_off`, you will otherwise hit
+`The "insecure-skip-verify" feature is not enabled`. Opt in at build time with an env var:
+
+```bash
+QUESTDB_INSECURE_SKIP_VERIFY=1 pip install -e . --force-reinstall --no-deps
+```
+
+Keep build isolation on (do **not** add `--no-build-isolation`): the build cythonizes
+`_client.pyx` against the pinned build-time numpy, and forcing it to use a venv whose numpy
+differs fails with `_PyUFuncObject_GET_ITEM_DATA` / `PyDataType_TYPEOBJ` compile errors. The
+env var still reaches the isolated build. (The alternative to `unsafe_off` is to trust the
+cert properly via `tls_roots`/`tls_ca`.)
+
 Verify:
 
 ```python
