@@ -70,6 +70,11 @@ public class CsvParallelSender {
     // SERVER_INFO which is only refreshed on a reconnect and so goes stale after an in-place
     // primary<->replica switch. The probe runs this each poll to report the true serving role.
     private static final String STATUS_QUERY = "switch status";
+    // WebSocketResponse.STATUS_INTERNAL_ERROR. Every transport-level terminal failure is
+    // reported with this status (QwpEgressIoThread raises it on socket death), so it is what
+    // separates "the connection died" from a SQL-level error on the same onError callback.
+    // Inlined rather than imported: WebSocketResponse is a wire-protocol detail of the client.
+    private static final byte QWP_STATUS_INTERNAL_ERROR = 0x06;
     // Zone for the query client (egress). Biases failover toward same-zone instances on
     // Enterprise; a no-op on OSS (which advertises no zone). Empty omits the key.
     private static final String DEFAULT_ZONE = "eu-west-1";
@@ -719,20 +724,30 @@ public class CsvParallelSender {
     // Starts a daemon thread that polls the latest ingested timestamp over a QWP query
     // client every intervalMs, printing to stdout. Independent of the senders. The client
     // fails over across the configured hosts automatically; onFailoverReset reports hops.
+    //
+    // The client is built INSIDE the poll loop and torn down on any connection loss, because
+    // a QwpQueryClient cannot recover on its own:
+    //   * connect() outside the loop means a server that is down at startup kills the probe
+    //     thread outright, and nothing ever restarts it;
+    //   * once a connection dies, the generation listener latches the terminal failure. With
+    //     failover on, execute() eventually leaves connected=false and every later execute()
+    //     throws "not connected; call connect() first". With failover off (a single --addrs
+    //     host) it is sneakier: connected stays TRUE, isConnected() keeps returning true, and
+    //     every execute() short-circuits on the latched failure and reports it through
+    //     onError() forever.
+    // Neither state clears by calling connect() again (it early-returns when connected), so
+    // recovery means close() + fromConfig() on a fresh instance.
     private static Thread startProbe(SenderCfg cfg, long intervalMs) {
         final Thread t = new Thread(() -> {
-            try (QwpQueryClient client = QwpQueryClient.fromConfig(queryClientConfig(cfg))) {
-                client.connect();
-                final QwpServerInfo info = client.getServerInfo();
-                if (info != null) {
-                    System.out.printf("[query client] connected, serving node=%s role=%s zone=%s cluster=%s%n",
-                            orNone(info.getNodeId()), QwpServerInfo.roleName(info.getRole()),
-                            orNone(info.getZoneId()), orNone(info.getClusterId()));
-                } else {
-                    System.out.println("[query client] connected");
-                }
+            QwpQueryClient client = null;
+            try {
                 final long[] latest = {Long.MIN_VALUE};
                 final boolean[] wasDown = {false};
+                // Set by the probe handler when the server reports a transport-level failure.
+                // Transport failures always carry STATUS_INTERNAL_ERROR; a SQL-level error
+                // (e.g. "table does not exist" before ingestion creates it) carries a different
+                // status and must NOT tear the connection down.
+                final boolean[] transportFailed = {false};
                 final QwpColumnBatchHandler handler = new QwpColumnBatchHandler() {
                     @Override
                     public void onBatch(QwpColumnBatch batch) {
@@ -749,7 +764,11 @@ public class CsvParallelSender {
 
                     @Override
                     public void onError(byte status, String message) {
-                        System.out.printf("[query client] server error: %s%n", message);
+                        if (status == QWP_STATUS_INTERNAL_ERROR) {
+                            transportFailed[0] = true;
+                        } else {
+                            System.out.printf("[query client] server error: %s%n", message);
+                        }
                     }
 
                     @Override
@@ -823,11 +842,29 @@ public class CsvParallelSender {
                     currentRole[0] = null;
                     targetRole[0] = null;
                     statusDiag[0] = null;
+                    transportFailed[0] = false;
                     try {
-                        client.execute(PROBE_QUERY, handler);
-                        if (wasDown[0]) {
-                            System.out.println("[query client] connection restored");
+                        // (Re)build on first pass and after every connection loss. A server that
+                        // is down at startup just leaves client == null and retries next tick.
+                        if (client == null) {
+                            client = QwpQueryClient.fromConfig(queryClientConfig(cfg));
+                            client.connect();
+                            final QwpServerInfo info = client.getServerInfo();
+                            final String what = wasDown[0] ? "connection restored" : "connected";
+                            if (info != null) {
+                                System.out.printf("[query client] %s, serving node=%s role=%s zone=%s cluster=%s%n",
+                                        what, orNone(info.getNodeId()), QwpServerInfo.roleName(info.getRole()),
+                                        orNone(info.getZoneId()), orNone(info.getClusterId()));
+                            } else {
+                                System.out.printf("[query client] %s%n", what);
+                            }
                             wasDown[0] = false;
+                        }
+                        client.execute(PROBE_QUERY, handler);
+                        // A transport failure is reported through onError, not by throwing, and
+                        // it leaves the client permanently latched. Force the rebuild path.
+                        if (transportFailed[0] || !client.isConnected()) {
+                            throw new IllegalStateException("query connection lost");
                         }
                         if (latest[0] != Long.MIN_VALUE) {
                             // trades designated timestamp is microseconds by default.
@@ -880,6 +917,15 @@ public class CsvParallelSender {
                                     String.valueOf(e.getMessage()));
                             wasDown[0] = true;
                         }
+                        // Drop the latched client; the next tick builds a fresh one.
+                        if (client != null) {
+                            try {
+                                client.close();
+                            } catch (Exception ignored) {
+                                // A dead connection often fails to close cleanly; nothing to do.
+                            }
+                            client = null;
+                        }
                     }
                     Thread.sleep(intervalMs);
                 }
@@ -887,6 +933,10 @@ public class CsvParallelSender {
                 Thread.currentThread().interrupt();
             } catch (Exception e) {
                 System.err.println("[probe] stopped: " + e.getMessage() + upgradeHint(e));
+            } finally {
+                if (client != null) {
+                    client.close();
+                }
             }
         }, "qwp-probe");
         t.setDaemon(true);
