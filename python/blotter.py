@@ -35,11 +35,23 @@ import argparse
 import os
 import sys
 import time
+import warnings
 from datetime import datetime, timezone
 
 import polars as pl
 
 import questdb
+
+# to_polars() builds SYMBOL Categoricals with a UInt32 -> Categorical cast (egress.pxi:1890)
+# that polars 1.43 deprecates in favour of .cat.to(). Harmless, but the message embeds a
+# fresh Categories UUID on every call, so Python's once-per-location dedup never matches and
+# the warnings re-fire at the poll rate, shredding the in-place redraw. Drop this filter once
+# the client stops using the deprecated cast.
+warnings.filterwarnings(
+    "ignore",
+    message=r"casting from UInt32 to Categorical",
+    category=DeprecationWarning,
+)
 
 
 def use_tls(args):

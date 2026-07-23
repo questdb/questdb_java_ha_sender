@@ -24,10 +24,20 @@ import json
 import os
 import sys
 import threading
+import warnings
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import questdb
+
+# See blotter.py: to_polars() uses a UInt32 -> Categorical cast that polars 1.43 deprecates,
+# and the message carries a fresh UUID per call, so it defeats warning dedup and floods the
+# server log at the poll rate.
+warnings.filterwarnings(
+    "ignore",
+    message=r"casting from UInt32 to Categorical",
+    category=DeprecationWarning,
+)
 
 
 def use_tls(args):
