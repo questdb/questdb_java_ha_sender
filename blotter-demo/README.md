@@ -116,7 +116,8 @@ all projects**, not just this demo — only run it if you genuinely mean machine
    then:
    - waits for QuestDB,
    - `curl` creates `core_price_demo` (base table) and `core_price_lv` (live view),
-   - runs `feed.py` in the background (~2000 rows/s of synthetic crypto/FX bids),
+   - runs `feed.py` in the background (synthetic crypto/FX bids; ~2000 rows/s by
+     default, tunable to 100K+/s via `FEED_TARGET_RPS` — see Knobs),
    - runs `blotter.py` in the foreground, polling the live view at 10 Hz.
 
 The live view:
@@ -141,10 +142,22 @@ refreshed at `--rate` Hz.
 
 ## Knobs
 
-- **Feed rate / flush frequency.** `FEED_FLUSH_HZ` (default 20, i.e. a flush every
-  50 ms) and `FEED_ROWS_PER_FLUSH` (default 100) on the `demo` service set how
-  fast rows land and how often they are flushed. 20 flushes/s keeps the blotter
-  visibly moving. Prices are illustrative 2026 levels, not live market data.
+- **Feed rate.** `FEED_TARGET_RPS` (default 2000) on the `demo` service sets the
+  target rows/second. The feed builds one vectorized Polars DataFrame per flush
+  and ships it with a single columnar `Sender.dataframe(...)` call, so a single
+  process sustains ~1M rows/s — set `FEED_TARGET_RPS=100000` (or higher) to stress
+  ingestion:
+  ```bash
+  docker compose run --rm -e FEED_TARGET_RPS=100000 demo
+  ```
+  Prices are illustrative 2026 levels, not live market data.
+- **Flush cadence / workers.** `FEED_FLUSH_HZ` (default 20) is flushes/second per
+  worker; batch size is `FEED_TARGET_RPS / FEED_WORKERS / FEED_FLUSH_HZ`.
+  `FEED_WORKERS` (default 1) forks that many parallel sender processes, each
+  targeting an equal share — only needed to push past what one process can
+  generate. The feed prints its measured `~N rows/s` every 5 s; confirm the true
+  server-side rate with
+  `select count()/10.0 from core_price_demo where timestamp > dateadd('s', -10, now())`.
 - **Blotter refresh.** `--rate` Hz in `entrypoint.sh` (default 10) sets how often
   the terminal redraws.
 - **What the blotter shows.** Defaults to the last 20 rows of the live view
