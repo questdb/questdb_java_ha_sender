@@ -1,15 +1,20 @@
 # One-command live blotter demo
 
-A self-contained Docker demo: QuestDB with **LIVE VIEW**, the unreleased
-**questdb 5.0 Python client**, a synthetic price feed, and the terminal blotter
-rendering on top of a live view. Your colleague needs **nothing but Docker** — no
-Python, no Rust, no client build.
+A self-contained Docker demo: QuestDB with **LIVE VIEW**, the **questdb 5.0 Python
+client**, a synthetic price feed, and the terminal blotter rendering on top of a
+live view. Your colleague needs **nothing but Docker** — no Python, no client
+install.
+
+Nothing is built from source anymore: QuestDB comes from the official `nightly`
+image (the first images to ship `LIVE VIEW`), and the client installs from PyPI
+(`questdb==5.0.0`). The only image `build` does is layer the feed/blotter scripts
+onto `python:3.12-slim` — a few seconds.
 
 ## Run it
 
 ```bash
 cd blotter-demo
-docker compose build            # one-time, slow: builds QuestDB + the client from source
+docker compose build            # one-time, fast: pip installs the client + copies scripts
 docker compose run --rm demo    # QuestDB starts, then the blotter draws in your terminal
 ```
 
@@ -22,44 +27,44 @@ docker compose down             # stop QuestDB
 
 ## Running it again
 
-The slow part is the one-time `docker compose build`. Once the images exist, every
-`docker compose run --rm demo` skips the build entirely and just starts containers,
-so repeat runs are fast — the only cost is a few seconds of JVM startup as QuestDB
-cold-starts (the `--rm`/`down` flow disposes the container each time, so the table,
-live view, and history start fresh on every run — intended for a demo). A rebuild
-only happens if you edit a file a Docker layer depends on, and even then only the
-cheap final layers re-run — never the Rust/Maven builds — unless you change the
-pinned client/server commits.
+Once the `demo` image exists and the `nightly` image is pulled, every
+`docker compose run --rm demo` just starts containers, so repeat runs are fast —
+the only cost is a few seconds of JVM startup as QuestDB cold-starts (the
+`--rm`/`down` flow disposes the container each time, so the table, live view, and
+history start fresh on every run — intended for a demo). A rebuild only happens if
+you edit `feed.py`, `blotter.py`, or `entrypoint.sh` — and even then only the cheap
+COPY layers re-run.
+
+To get a newer QuestDB, re-pull the moving tag: `docker compose pull questdb`.
 
 If a `docker compose down` reports "network still in use", a run container lingered
 from a Ctrl+C; clear it with `docker compose down --remove-orphans`.
 
 ## Removing everything at the end
 
-This demo creates four kinds of Docker artifact: two built images
-(`blotter-demo-questdb`, `blotter-demo-demo`), a network and containers, build
-cache (the Rust + Maven layers — the bulk of the disk), and base images it pulls
-(`python:3.12-slim`, `eclipse-temurin:25-jdk`, `eclipse-temurin:25-jre`).
+This demo creates: one built image (`blotter-demo-demo`), a network and containers,
+a little build cache (the pip layer), and two base images it pulls
+(`python:3.12-slim`, `questdb/questdb:nightly`).
 
 **Removing an image is not destructive the way deleting a volume is** — any image
-can be re-pulled from Docker Hub on demand, so the worst case of over-removing is a
-re-download later. No data is lost. The demo defines no named volumes.
+can be re-pulled on demand, so the worst case of over-removing is a re-download
+later. No data is lost. The demo defines no named volumes.
 
-### Step 1 — containers, network, and the two built images (scoped, safe)
+### Step 1 — containers, network, and the built image (scoped, safe)
 
 ```bash
 docker compose down --rmi local --remove-orphans
 ```
 
-Touches only this project. `--rmi local` deletes the two images the demo built;
-`--remove-orphans` clears any run container left by a Ctrl+C.
+Touches only this project. `--rmi local` deletes the `blotter-demo-demo` image the
+demo built; `--remove-orphans` clears any run container left by a Ctrl+C.
 
 ### Step 2 — the base images this demo pulled
 
 Docker does not record when an image was pulled, so "was it already there before?"
 can only be answered by snapshotting the image list **before** the first build.
 
-**Before your first `docker compose build`**, record what already exists:
+**Before your first `docker compose build`/`pull`**, record what already exists:
 
 ```bash
 docker image ls --format '{{.Repository}}:{{.Tag}}' | sort > ~/blotter-demo-images-before.txt
@@ -69,20 +74,20 @@ docker image ls --format '{{.Repository}}:{{.Tag}}' | sort > ~/blotter-demo-imag
 only if this demo pulled it):
 
 ```bash
-for img in python:3.12-slim eclipse-temurin:25-jdk eclipse-temurin:25-jre; do
+for img in python:3.12-slim questdb/questdb:nightly; do
   grep -qxF "$img" ~/blotter-demo-images-before.txt || docker rmi "$img"
 done
 ```
 
 If you did **not** take the snapshot, you cannot tell which were pre-existing.
-Either leave them, or just remove all three — re-pulling is harmless (no data loss),
+Either leave them, or just remove both — re-pulling is harmless (no data loss),
 it only costs a download if another project needs them later:
 
 ```bash
-docker rmi python:3.12-slim eclipse-temurin:25-jdk eclipse-temurin:25-jre
+docker rmi python:3.12-slim questdb/questdb:nightly
 ```
 
-### Step 3 — reclaim the build cache (the big disk win)
+### Step 3 — reclaim the build cache
 
 ```bash
 docker builder prune -f
@@ -92,8 +97,8 @@ docker builder prune -f
 deletes images, containers, or volumes** — those are safe. But it is **system-wide,
 not scoped to this demo**: it clears the build cache of every project, so other
 projects' next builds recompute their layers (slower, but nothing is lost — cache
-only). There is no per-project build-cache prune. If this demo is your only heavy
-Docker build, it is effectively scoped anyway.
+only). There is no per-project build-cache prune. This demo's own cache is now tiny
+(just the pip layer), so this step mostly matters if other projects share the daemon.
 
 ### Not recommended
 
@@ -102,12 +107,13 @@ all projects**, not just this demo — only run it if you genuinely mean machine
 
 ## What it does
 
-1. **`questdb`** — built from source at the commit that first ships `LIVE VIEW`
-   (`90a1b54c…`) with the web console (`-P build-web-console`). The server is
-   reachable from the host at **http://localhost:19000** (console + `/exec`); this
-   host port is deliberately 19000, not 9000, so it never collides with a local
-   QuestDB. The blotter reaches the server internally over the compose network.
-2. **`demo`** — builds the 5.0 client (`ea54b6f…`, Rust 1.91.1 + Cython), then:
+1. **`questdb`** — the official `questdb/questdb:nightly` image, the first to ship
+   `LIVE VIEW`. Reachable from the host at **http://localhost:19000** (console +
+   `/exec`); this host port is deliberately 19000, not 9000, so it never collides
+   with a local QuestDB. The blotter reaches the server internally over the compose
+   network at `questdb:9000`.
+2. **`demo`** — `python:3.12-slim` + `pip install questdb==5.0.0 polars pyarrow`,
+   then:
    - waits for QuestDB,
    - `curl` creates `core_price_demo` (base table) and `core_price_lv` (live view),
    - runs `feed.py` in the background (~2000 rows/s of synthetic crypto/FX bids),
@@ -145,28 +151,28 @@ refreshed at `--rate` Hz.
   (`--table core_price_lv --limit -20`). Adjust the count with `--limit`, or pass
   `--query "<sql>"` in `entrypoint.sh` to run any SQL against the view verbatim.
 
-## Pins and durability
+## Versions
 
-Both sources are pinned by commit SHA for reproducibility:
-
-| Component | Repo | Commit |
+| Component | Source | Version |
 | --- | --- | --- |
-| QuestDB server | `questdb/questdb` | `90a1b54c98b10fad5304b1ad817a69cda25e52ad` |
-| Python client | `questdb/py-questdb-client` | `ea54b6f474062c144aa6395facad42e77c99e6f6` |
+| QuestDB server | `questdb/questdb:nightly` | first images with `LIVE VIEW` (merged 2026-08, commit `73685fa`) |
+| Python client | PyPI `questdb` | `5.0.0` |
 
-A pinned SHA is fetchable from GitHub only while it stays reachable from a ref.
-The questdb commit is expected to merge to `main`, so it survives. The **client
-commit lives on `jh_experiment_new_ilp`, which may be deleted before it merges** —
-if that happens the build's `git checkout` will fail. Run `./vendor.sh` to
-snapshot the client source into `blotter-demo/vendor/` and follow its printed instructions
-to switch the Dockerfile to the local tarball.
+`:nightly` is a **moving tag** — every pull may bring a newer build, so
+reproducibility is weaker than a fixed version. For a "colleague runs it once" demo
+that is fine. To freeze it, pin the `image:` in `docker-compose.yml` by digest
+(`questdb/questdb@sha256:…`).
 
-## When the client ships / questdb merges
+## When QuestDB 10.0 ships
 
-- Once `LIVE VIEW` lands in a nightly, delete `questdb.Dockerfile` and set
-  `image: questdb/questdb:nightly` on the `questdb` service.
-- Once the client is on PyPI, replace the whole `client-build` stage with
-  `pip install questdb==<version>`.
+`LIVE VIEW` is expected in the **10.0** stable release. Once it lands, swap the
+moving nightly tag for the pinned release in `docker-compose.yml`:
+
+```yaml
+    image: questdb/questdb:10.0
+```
+
+That is the only change — everything else already uses released components.
 
 ## Sharing without a rebuild
 
@@ -174,4 +180,4 @@ To hand a colleague an image that needs no build at all, either push to a regist
 (`docker compose build && docker compose push`, after adding `image:` names) or
 `docker save`/`docker load` a tarball. Both are architecture-specific — an amd64
 image runs under emulation on Apple Silicon. Letting them `docker compose build`
-locally avoids that by building for their arch.
+locally (a few seconds now) avoids that by building for their arch.

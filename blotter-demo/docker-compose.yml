@@ -1,6 +1,6 @@
 # One-command blotter demo. From this directory:
 #
-#     docker compose build           # one-time, slow (builds QuestDB + client from source)
+#     docker compose build           # one-time: builds the small demo image (client from PyPI)
 #     docker compose run --rm demo   # starts QuestDB, then the blotter in your terminal
 #
 # `run` (not `up`) gives the blotter a real TTY for the in-place redraw. Ctrl+C quits;
@@ -8,9 +8,11 @@
 
 services:
   questdb:
-    build:
-      context: ..
-      dockerfile: blotter-demo/questdb.Dockerfile
+    # QuestDB nightly ships LIVE VIEW (merged 2026-08, commit 73685fa; not yet in a
+    # stable release or the :latest image). Swap to questdb/questdb:10.0 once 10.0
+    # ships. `:nightly` is a moving tag, so reproducibility is weaker than a pin — fine
+    # for a demo; pin by digest if you need it frozen.
+    image: questdb/questdb:nightly
     ports:
       # Host 19000 -> container 9000. Deliberately NOT 9000 on the host: that is
       # the default QuestDB port, and a local QuestDB there would collide. The
