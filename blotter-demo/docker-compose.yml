@@ -1,0 +1,41 @@
+# One-command blotter demo. From this directory:
+#
+#     docker compose build           # one-time: builds the small demo image (client from PyPI)
+#     docker compose run --rm demo   # starts QuestDB, then the blotter in your terminal
+#
+# `run` (not `up`) gives the blotter a real TTY for the in-place redraw. Ctrl+C quits;
+# --rm cleans up the demo container. Stop QuestDB afterwards with `docker compose down`.
+
+services:
+  questdb:
+    # QuestDB nightly ships LIVE VIEW (merged 2026-08, commit 73685fa; not yet in a
+    # stable release or the :latest image). Swap to questdb/questdb:10.0 once 10.0
+    # ships. `:nightly` is a moving tag, so reproducibility is weaker than a pin — fine
+    # for a demo; pin by digest if you need it frozen.
+    image: questdb/questdb:nightly
+    ports:
+      # Host 19000 -> container 9000. Deliberately NOT 9000 on the host: that is
+      # the default QuestDB port, and a local QuestDB there would collide. The
+      # blotter itself never uses this mapping (it reaches the server over the
+      # compose network as questdb:9000); it is only so you can inspect the DEMO's
+      # server from the host at http://localhost:19000 without touching your local one.
+      - "19000:9000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS 'http://localhost:9000/exec?query=select%201' -o /dev/null || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 5s
+
+  demo:
+    build:
+      context: ..
+      dockerfile: blotter-demo/demo.Dockerfile
+    depends_on:
+      questdb:
+        condition: service_healthy
+    tty: true
+    stdin_open: true
+    environment:
+      QDB_ADDR: questdb:9000
+      QDB_HTTP: questdb:9000

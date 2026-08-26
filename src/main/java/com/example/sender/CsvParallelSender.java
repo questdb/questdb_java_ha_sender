@@ -36,6 +36,13 @@ public class CsvParallelSender {
     private static final String DEFAULT_ADDRS = "questdb:9000";
     private static final long DEFAULT_TOTAL_EVENTS = 1_000_000L;
     private static final int DEFAULT_DELAY_MS = 50;
+    // Target aggregate generation rate in rows/second across ALL workers. 0 disables rate
+    // limiting and falls back to --delay-ms. When > 0 it takes precedence over --delay-ms:
+    // each worker paces itself to its share (rate / num-senders) against a deadline schedule,
+    // so the process approximates the target regardless of worker count. Unlike a fixed
+    // per-row sleep, it sends rows back-to-back and only sleeps when ahead of schedule, so it
+    // can sustain high rates (e.g. 300000) that a --delay-ms of >=1 could never reach.
+    private static final long DEFAULT_RATE = 0L;
     private static final int DEFAULT_NUM_SENDERS = 10;
     private static final int DEFAULT_RETRY_TIMEOUT = 360000;
     private static final String DEFAULT_CSV = "./trades20250728.csv.gz";
@@ -63,12 +70,23 @@ public class CsvParallelSender {
     // SERVER_INFO which is only refreshed on a reconnect and so goes stale after an in-place
     // primary<->replica switch. The probe runs this each poll to report the true serving role.
     private static final String STATUS_QUERY = "switch status";
+    // WebSocketResponse.STATUS_INTERNAL_ERROR. Every transport-level terminal failure is
+    // reported with this status (QwpEgressIoThread raises it on socket death), so it is what
+    // separates "the connection died" from a SQL-level error on the same onError callback.
+    // Inlined rather than imported: WebSocketResponse is a wire-protocol detail of the client.
+    private static final byte QWP_STATUS_INTERNAL_ERROR = 0x06;
     // Zone for the query client (egress). Biases failover toward same-zone instances on
     // Enterprise; a no-op on OSS (which advertises no zone). Empty omits the key.
     private static final String DEFAULT_ZONE = "eu-west-1";
 
     // Rows sent (client-side) across all workers, for the once-per-second progress reporter.
     private static final AtomicLong TOTAL_SENT = new AtomicLong();
+    // Rows the server has acknowledged, per worker (summed by the reporter). Fed from the QWP
+    // ack watermark (getAckedFsn) - the real committed count, with no extra query round-trips.
+    private static AtomicLong[] ACKED_ROWS = new AtomicLong[0];
+    // Set once all rows are submitted: silences the per-second progress + probe lines so the
+    // commit-drain tail is quiet and only the final summary line is printed.
+    private static volatile boolean SUBMIT_COMPLETE = false;
 
     public static void main(String[] args) throws Exception {
         // Parse CLI flags
@@ -80,6 +98,7 @@ public class CsvParallelSender {
         final String password = a.get("--password");         // optional
         final long totalEvents = Long.parseLong(a.getOrDefault("--total-events", String.valueOf(DEFAULT_TOTAL_EVENTS)));
         final int delayMs = Integer.parseInt(a.getOrDefault("--delay-ms", String.valueOf(DEFAULT_DELAY_MS)));
+        final long rate = Long.parseLong(a.getOrDefault("--rate", String.valueOf(DEFAULT_RATE)));
         final int numSenders = Integer.parseInt(a.getOrDefault("--num-senders", String.valueOf(DEFAULT_NUM_SENDERS)));
         final int retryTimeout = Integer.parseInt(a.getOrDefault("--retry-timeout", String.valueOf(DEFAULT_RETRY_TIMEOUT)));
         final String csvPath = a.getOrDefault("--csv", DEFAULT_CSV);
@@ -148,12 +167,25 @@ public class CsvParallelSender {
             System.err.println("--total-events must be > 0");
             System.exit(2);
         }
+        if (rate < 0) {
+            System.err.println("--rate must be >= 0 (0 disables rate limiting, falling back to --delay-ms)");
+            System.exit(2);
+        }
+        // --rate takes precedence: when set it drives the pacing and --delay-ms is ignored.
+        if (rate > 0 && delayMs > 0 && a.containsKey("--delay-ms")) {
+            System.err.println("[warn] --rate " + rate + " overrides --delay-ms " + delayMs
+                    + " (rate limiting drives pacing; the per-row delay is ignored)");
+        }
 
         final SenderCfg cfg = new SenderCfg(protocol, addrsCsv, token, username, password, retryTimeout,
                 senderIdBase, storeForwardDir, batchSize, batchesPerTransaction, numSenders, enterprise, zone,
-                connectTimeoutMs);
+                connectTimeoutMs, rate);
 
+        final String pacing = rate > 0
+                ? "rate=" + rate + " rows/s (aggregate across " + numSenders + " workers)"
+                : "delay-ms=" + delayMs;
         final String conf = buildConf(addrsCsv, token, username, password, retryTimeout);
+        System.out.println("Pacing: " + pacing);
         System.out.println("Ingestion started. Protocol: " + protocol
                 + (protocol.equals("qwp")
                         ? " (WebSocket, sender-id=" + senderIdBase + ", store-and-forward=" + storeForwardDir
@@ -180,18 +212,52 @@ public class CsvParallelSender {
         // Time only the ingestion: start right before the workers begin sending.
         final long startNanos = System.nanoTime();
 
-        // Progress reporter: prints rows/s (client-side, sent) once per second.
+        // Per-worker acknowledged-row counters, summed by the reporter. Fed from the QWP ack
+        // watermark (getAckedFsn) - the real committed progress, with no extra query round-trips.
+        ACKED_ROWS = new AtomicLong[numSenders];
+        for (int i = 0; i < numSenders; i++) {
+            ACKED_ROWS[i] = new AtomicLong();
+        }
+
+        // Records (to ~1s resolution) when all rows were submitted and when all were acknowledged,
+        // so the summary can separate the submit phase from the commit-drain tail.
+        final AtomicLong appendDoneNanos = new AtomicLong(0);
+        final AtomicLong commitDoneNanos = new AtomicLong(0);
+
+        // Progress reporter: once per second, prints BOTH counters - submitted (client-side, can
+        // run ahead of the server) and acknowledged (rows the server has actually committed). The
+        // gap between them is the buffered backlog; during the drain, submitted is flat while
+        // acknowledged keeps climbing (real work), so there is no misleading "0 rows/s".
         final Thread reporter = new Thread(() -> {
-            long last = 0;
+            long lastSub = 0;
+            long lastAck = 0;
             while (true) {
                 try {
                     Thread.sleep(1000);
                 } catch (InterruptedException ie) {
                     return;
                 }
-                long now = TOTAL_SENT.get();
-                System.out.printf("[progress] sent=%,d rate=%,d rows/s%n", now, now - last);
-                last = now;
+                final long sub = TOTAL_SENT.get();
+                long ack = 0;
+                for (AtomicLong al : ACKED_ROWS) {
+                    ack += al.get();
+                }
+                if (sub >= totalEvents) {
+                    appendDoneNanos.compareAndSet(0, System.nanoTime());
+                    SUBMIT_COMPLETE = true;
+                }
+                if (ack >= totalEvents) {
+                    commitDoneNanos.compareAndSet(0, System.nanoTime());
+                }
+                // Once everything is submitted, go quiet - no per-second spam while the client
+                // drains. The final "All workers completed ..." summary is the single last line.
+                if (SUBMIT_COMPLETE) {
+                    continue;
+                }
+                System.out.printf("[progress] submitted=%,d (+%,d/s) | acknowledged=%,d (+%,d/s)%n",
+                        sub, sub - lastSub, ack, ack - lastAck);
+                lastSub = sub;
+                lastAck = ack;
             }
         });
         reporter.setDaemon(true);
@@ -228,8 +294,17 @@ public class CsvParallelSender {
         }
         final double elapsedSec = (System.nanoTime() - startNanos) / 1_000_000_000.0;
         final double rowsPerSec = elapsedSec > 0 ? totalEvents / elapsedSec : 0;
-        System.out.printf("All workers completed. protocol=%s events=%d elapsed=%.3f s throughput=%,.0f rows/s%n",
+        System.out.printf("All workers completed. protocol=%s events=%d elapsed=%.3f s throughput=%,.0f rows/s (acknowledged, end-to-end)%n",
                 protocol, totalEvents, elapsedSec, rowsPerSec);
+        // Split the wall time into submit vs commit-drain, so the fast "submitted" rate is not
+        // mistaken for durable throughput. appendDoneNanos/commitDoneNanos are ~1s-resolution.
+        final long submitNanos = appendDoneNanos.get();
+        if (submitNanos > 0) {
+            final double submitSec = (submitNanos - startNanos) / 1_000_000_000.0;
+            final double submitRate = submitSec > 0 ? totalEvents / submitSec : 0;
+            System.out.printf("  submit phase %.3f s (%,.0f rows/s submitted) + commit drain %.3f s%n",
+                    submitSec, submitRate, Math.max(0.0, elapsedSec - submitSec));
+        }
     }
 
     private static void runWorker(
@@ -259,6 +334,19 @@ public class CsvParallelSender {
                 : isUdp
                         ? cfg.batchSize
                         : 0L;
+        // Rate limiting (when --rate > 0): pace this worker to its share of the aggregate
+        // target, rate / num-senders rows/second. intervalNanos is the ideal spacing between
+        // this worker's rows; we track a deadline schedule from loop entry and only sleep when
+        // we are running ahead of it, so rows go out back-to-back until we get ahead. This
+        // reaches high rates that a fixed per-row Thread.sleep cannot. 0 => rate disabled.
+        final double intervalNanos = cfg.rate > 0
+                ? 1_000_000_000.0 * cfg.numSenders / cfg.rate
+                : 0.0;
+        final boolean rateLimited = intervalNanos > 0.0;
+        final long paceStartNanos = System.nanoTime();
+        // QWP ack tracking: map each flush sequence -> cumulative rows, so getAckedFsn() can be
+        // resolved to acknowledged rows. Only QWP carries frame sequence numbers and acks.
+        final java.util.TreeMap<Long, Long> fsnToRows = isQwp ? new java.util.TreeMap<>() : null;
         try ( Sender sender = buildSender(cfg, senderId)) { //( Sender sender = Sender.fromConfig(conf)) {
             final int n = rows.size();
             for (long i = 0; i < totalEvents; i++) {
@@ -279,11 +367,11 @@ public class CsvParallelSender {
                     if (secondsOffset != 0) {
                         ts = ts.plusSeconds(secondsOffset);
                     }
-                    sender.at(ts);
+                    atNanos(sender, ts);
                 } else if (secondsOffset != 0) {
-                    sender.at(Instant.now().plusSeconds(secondsOffset));
+                    atNanos(sender, Instant.now().plusSeconds(secondsOffset));
                 } else if (perRowMicros) {
-                    sender.at(Instant.now());
+                    atNanos(sender, Instant.now());
                 } else {
                     sender.atNow();
                 }
@@ -291,12 +379,34 @@ public class CsvParallelSender {
                 sent++;
                 TOTAL_SENT.incrementAndGet();
 
-                // QWP-only: commit a transaction every batchSize * batchesPerTransaction rows.
+                // Commit a transaction every batchSize * batchesPerTransaction rows (QWP), or flush
+                // every batchSize rows (UDP). For QWP, record the flush sequence and refresh this
+                // worker's acknowledged-row count from the ack watermark (no extra round-trip).
                 if (commitEveryRows > 0 && sent % commitEveryRows == 0) {
-                    sender.flush();
+                    if (isQwp) {
+                        fsnToRows.put(sender.flushAndGetSequence(), sent);
+                        ACKED_ROWS[senderId].set(ackedRows(sender, fsnToRows));
+                    } else {
+                        sender.flush();
+                    }
                 }
 
-                if (delayMs > 0) {
+                if (rateLimited) {
+                    // Deadline for the row we have just sent (sent is 1-based here). Sleep only
+                    // while ahead of schedule; if behind, fall through and keep sending. The 1ms
+                    // floor coalesces many rows into one sleep so we do not burn CPU sleeping for
+                    // sub-millisecond slivers at high rates.
+                    final long targetNanos = paceStartNanos + Math.round(sent * intervalNanos);
+                    final long sleepNanos = targetNanos - System.nanoTime();
+                    if (sleepNanos > 1_000_000L) {
+                        try {
+                            Thread.sleep(sleepNanos / 1_000_000L, (int) (sleepNanos % 1_000_000L));
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            throw new RuntimeException("Interrupted", ie);
+                        }
+                    }
+                } else if (delayMs > 0) {
                     try {
                         Thread.sleep(delayMs);
                     } catch (InterruptedException ie) {
@@ -305,13 +415,44 @@ public class CsvParallelSender {
                     }
                 }
             }
-            // Explicit flush at the end of this connection's work
-            sender.flush();
+            // Final flush. For QWP, wait for the server to acknowledge everything so the acked
+            // counter climbs to the full count during the drain (the real committed progress). The
+            // await loop drives the connection and refreshes the counter; capped to avoid a hang.
+            if (isQwp) {
+                final long finalSeq = sender.flushAndGetSequence();
+                fsnToRows.put(finalSeq, sent);
+                final long drainDeadline = System.nanoTime() + 600_000_000_000L; // 10 min cap
+                while (!sender.awaitAckedFsn(finalSeq, 200L) && System.nanoTime() < drainDeadline) {
+                    ACKED_ROWS[senderId].set(ackedRows(sender, fsnToRows));
+                }
+            } else {
+                sender.flush();
+            }
+            ACKED_ROWS[senderId].set(sent);
             System.out.printf("Sender %d finished sending %d events%n", senderId, sent);
         } catch (Exception e) {
             System.err.printf("Sender %d got error: %s%s%n", senderId, e.toString(), upgradeHint(e));
             throw new RuntimeException(e);
         }
+    }
+
+    // Rows the server has acknowledged for this sender: map the ack watermark (getAckedFsn) back to
+    // the cumulative row count recorded at the latest fully-acknowledged flush. Zero round-trips -
+    // the ack watermark rides the ingest connection.
+    private static long ackedRows(Sender sender, java.util.TreeMap<Long, Long> fsnToRows) {
+        final java.util.Map.Entry<Long, Long> e = fsnToRows.floorEntry(sender.getAckedFsn());
+        return e != null ? e.getValue() : 0L;
+    }
+
+    // Send the designated timestamp at NANOSECOND resolution. The client's at(Instant) path
+    // delivers only microseconds (sub-microsecond digits are dropped before the wire), so we
+    // convert to epoch-nanos and use at(long, NANOS) to carry full nanosecond precision.
+    // QuestDB stores at the target column's resolution: a micros TIMESTAMP column silently
+    // truncates the extra digits, a TIMESTAMP_NS column keeps them. The multiply stays within
+    // long range for any realistic date (epochSecond * 1e9 overflows only past year ~2262).
+    private static void atNanos(Sender sender, Instant ts) {
+        final long epochNanos = ts.getEpochSecond() * 1_000_000_000L + ts.getNano();
+        sender.at(epochNanos, ChronoUnit.NANOS);
     }
 
     private static List<TradeRow> loadCsv(String path, boolean needTimestamp) throws Exception {
@@ -583,20 +724,30 @@ public class CsvParallelSender {
     // Starts a daemon thread that polls the latest ingested timestamp over a QWP query
     // client every intervalMs, printing to stdout. Independent of the senders. The client
     // fails over across the configured hosts automatically; onFailoverReset reports hops.
+    //
+    // The client is built INSIDE the poll loop and torn down on any connection loss, because
+    // a QwpQueryClient cannot recover on its own:
+    //   * connect() outside the loop means a server that is down at startup kills the probe
+    //     thread outright, and nothing ever restarts it;
+    //   * once a connection dies, the generation listener latches the terminal failure. With
+    //     failover on, execute() eventually leaves connected=false and every later execute()
+    //     throws "not connected; call connect() first". With failover off (a single --addrs
+    //     host) it is sneakier: connected stays TRUE, isConnected() keeps returning true, and
+    //     every execute() short-circuits on the latched failure and reports it through
+    //     onError() forever.
+    // Neither state clears by calling connect() again (it early-returns when connected), so
+    // recovery means close() + fromConfig() on a fresh instance.
     private static Thread startProbe(SenderCfg cfg, long intervalMs) {
         final Thread t = new Thread(() -> {
-            try (QwpQueryClient client = QwpQueryClient.fromConfig(queryClientConfig(cfg))) {
-                client.connect();
-                final QwpServerInfo info = client.getServerInfo();
-                if (info != null) {
-                    System.out.printf("[query client] connected, serving node=%s role=%s zone=%s cluster=%s%n",
-                            orNone(info.getNodeId()), QwpServerInfo.roleName(info.getRole()),
-                            orNone(info.getZoneId()), orNone(info.getClusterId()));
-                } else {
-                    System.out.println("[query client] connected");
-                }
+            QwpQueryClient client = null;
+            try {
                 final long[] latest = {Long.MIN_VALUE};
                 final boolean[] wasDown = {false};
+                // Set by the probe handler when the server reports a transport-level failure.
+                // Transport failures always carry STATUS_INTERNAL_ERROR; a SQL-level error
+                // (e.g. "table does not exist" before ingestion creates it) carries a different
+                // status and must NOT tear the connection down.
+                final boolean[] transportFailed = {false};
                 final QwpColumnBatchHandler handler = new QwpColumnBatchHandler() {
                     @Override
                     public void onBatch(QwpColumnBatch batch) {
@@ -613,7 +764,11 @@ public class CsvParallelSender {
 
                     @Override
                     public void onError(byte status, String message) {
-                        System.out.printf("[query client] server error: %s%n", message);
+                        if (status == QWP_STATUS_INTERNAL_ERROR) {
+                            transportFailed[0] = true;
+                        } else {
+                            System.out.printf("[query client] server error: %s%n", message);
+                        }
                     }
 
                     @Override
@@ -687,11 +842,29 @@ public class CsvParallelSender {
                     currentRole[0] = null;
                     targetRole[0] = null;
                     statusDiag[0] = null;
+                    transportFailed[0] = false;
                     try {
-                        client.execute(PROBE_QUERY, handler);
-                        if (wasDown[0]) {
-                            System.out.println("[query client] connection restored");
+                        // (Re)build on first pass and after every connection loss. A server that
+                        // is down at startup just leaves client == null and retries next tick.
+                        if (client == null) {
+                            client = QwpQueryClient.fromConfig(queryClientConfig(cfg));
+                            client.connect();
+                            final QwpServerInfo info = client.getServerInfo();
+                            final String what = wasDown[0] ? "connection restored" : "connected";
+                            if (info != null) {
+                                System.out.printf("[query client] %s, serving node=%s role=%s zone=%s cluster=%s%n",
+                                        what, orNone(info.getNodeId()), QwpServerInfo.roleName(info.getRole()),
+                                        orNone(info.getZoneId()), orNone(info.getClusterId()));
+                            } else {
+                                System.out.printf("[query client] %s%n", what);
+                            }
                             wasDown[0] = false;
+                        }
+                        client.execute(PROBE_QUERY, handler);
+                        // A transport failure is reported through onError, not by throwing, and
+                        // it leaves the client permanently latched. Force the rebuild path.
+                        if (transportFailed[0] || !client.isConnected()) {
+                            throw new IllegalStateException("query connection lost");
                         }
                         if (latest[0] != Long.MIN_VALUE) {
                             // trades designated timestamp is microseconds by default.
@@ -725,8 +898,10 @@ public class CsvParallelSender {
                                 served = " served by role=" + handshake + " node=" + node + " zone=" + zone
                                         + " (handshake role; live 'switch status' unavailable, may be stale)";
                             }
-                            System.out.printf("[probe] latest trades timestamp = %s (raw=%d)%s%n",
-                                    ts, latest[0], served);
+                            if (!SUBMIT_COMPLETE) {
+                                System.out.printf("[probe] latest trades timestamp = %s (raw=%d)%s%n",
+                                        ts, latest[0], served);
+                            }
                             // Explain a missing live role at most once per 30s so it does not spam.
                             if (currentRole[0] == null && statusDiag[0] != null) {
                                 final long now = System.currentTimeMillis();
@@ -742,6 +917,15 @@ public class CsvParallelSender {
                                     String.valueOf(e.getMessage()));
                             wasDown[0] = true;
                         }
+                        // Drop the latched client; the next tick builds a fresh one.
+                        if (client != null) {
+                            try {
+                                client.close();
+                            } catch (Exception ignored) {
+                                // A dead connection often fails to close cleanly; nothing to do.
+                            }
+                            client = null;
+                        }
                     }
                     Thread.sleep(intervalMs);
                 }
@@ -749,6 +933,10 @@ public class CsvParallelSender {
                 Thread.currentThread().interrupt();
             } catch (Exception e) {
                 System.err.println("[probe] stopped: " + e.getMessage() + upgradeHint(e));
+            } finally {
+                if (client != null) {
+                    client.close();
+                }
             }
         }, "qwp-probe");
         t.setDaemon(true);
@@ -834,6 +1022,7 @@ public class CsvParallelSender {
                 case "--password":
                 case "--total-events":
                 case "--delay-ms":
+                case "--rate":
                 case "--num-senders":
                 case "--csv":
                 case "--timestamp-from-file":
@@ -885,11 +1074,13 @@ public class CsvParallelSender {
         final boolean enterprise;
         final String zone;
         final int connectTimeoutMs;
+        // Target aggregate rows/second across all workers; 0 = disabled (use delayMs).
+        final long rate;
 
         SenderCfg(String protocol, String addrsCsv, String token, String username, String password,
                   int retryTimeout, String senderIdBase, String storeForwardDir,
                   int batchSize, int batchesPerTransaction, int numSenders, boolean enterprise, String zone,
-                  int connectTimeoutMs) {
+                  int connectTimeoutMs, long rate) {
             this.protocol = protocol;
             this.addrsCsv = addrsCsv;
             this.token = token;
@@ -904,6 +1095,7 @@ public class CsvParallelSender {
             this.enterprise = enterprise;
             this.zone = zone;
             this.connectTimeoutMs = connectTimeoutMs;
+            this.rate = rate;
         }
     }
 }

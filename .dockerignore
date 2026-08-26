@@ -1,0 +1,14 @@
+# Keep the Docker build context small. The demo images only need
+# python/blotter.py, blotter-demo/feed.py and blotter-demo/entrypoint.sh; everything below is
+# build output or large data that would otherwise be uploaded to the daemon.
+.git/
+**/target/
+**/build/
+rust/target/
+c/build/
+go/
+*.csv.gz
+**/__pycache__/
+**/*.pyc
+**/venv/
+**/.venv/

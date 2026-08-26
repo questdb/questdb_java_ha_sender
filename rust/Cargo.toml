@@ -1,0 +1,27 @@
+[package]
+name = "questdb_ha_sender"
+version = "1.0.0"
+edition = "2021"
+description = "Parallel CSV replay sender for QuestDB over QWP (WebSocket/UDP) and ILP/HTTP, a Rust port of the Java ha_sender"
+
+[[bin]]
+name = "csv_parallel_sender"
+path = "src/main.rs"
+
+[dependencies]
+# The Rust/C client, built locally from the c-questdb-client checkout. Default features
+# already enable every sync sender (TCP, HTTP, QWP/UDP, QWP/WebSocket) plus webpki roots
+# and the ring crypto backend; we add the egress reader (for the probe / query client),
+# zstd result decompression, and insecure-skip-verify (for tls_verify=unsafe_off).
+questdb-rs = { path = "../../../questdb/c-questdb-client/questdb-rs", features = [
+    "sync-reader-ws",
+    "compression-zstd",
+    "insecure-skip-verify",
+] }
+clap = { version = "4", features = ["derive"] }
+csv = "1"
+flate2 = "1"
+chrono = "0.4"
+
+[profile.release]
+opt-level = 3
