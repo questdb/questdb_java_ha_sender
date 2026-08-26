@@ -41,8 +41,10 @@ SELECT
 FROM fx_trades t
 ASOF JOIN market_data m ON (symbol)
 WHERE t.timestamp IN '$yesterday'
-ORDER BY t.timestamp
 """
+# No ORDER BY: fx_trades is scanned in designated-timestamp order, so rows already
+# arrive oldest first. Measured with and without, the plan is identical (no sort):
+# same first-batch latency, same total. It was redundant, not costly.
 
 CONF = os.environ.get("QDB_CONF") or (
     f"wss::addr={os.environ.get('QDB_ADDR', '172.31.42.41:9000')};"
