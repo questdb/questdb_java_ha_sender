@@ -18,9 +18,34 @@ are "materialise-whole" - they buffer the entire result; ``iter_arrow`` streams.
 A single connection is capped by the client's socket buffer at ~426 KB per RTT (the
 QWP client hardcodes a 4 MiB buffer that default Linux clamps; see ../boost_tcp.sh),
 so on a real network one reader is round-trip bound no matter how lean the loop is.
-``--readers N`` splits the row range across N parallel connections (each scans a
-timestamp slice) and reports the aggregate rows/sec, which is the way past the
-per-connection wall. ``--readers 1`` (default) is the plain single stream.
+``--readers N`` runs N parallel connections and reports the aggregate rows/sec, which
+is the way past the per-connection wall. ``--readers 1`` (default) is the plain
+single stream.
+
+How the row range is divided across those readers is ``--split``:
+
+``rows`` (default) cuts the range into ``--chunks`` row-offset slices using QuestDB's
+``LIMIT -m, -n`` (take the last m rows, then drop the last n, giving the half-open
+range ``[-m, -n)``), and workers pull chunks off a shared queue. Two consequences
+matter. Chunks hold an equal number of rows regardless of how unevenly the data is
+distributed in time, and with ``chunks > readers`` no single worker owns the whole
+cold end of the range - work is interleaved and self-balancing, since a worker that
+lands on cached data just takes the next chunk. It also needs no preliminary query
+and never has to know the designated timestamp's name.
+
+The offset skip is metadata-only, not a scan: ``PageFrameRecordCursorImpl.skipRows``
+walks whole page frames subtracting ``partitionHi - partitionLo`` and only descends
+into the frame where the skip lands, so skipping billions of rows costs microseconds
+(measured: 10.4B rows skipped in 12ms). Do not be alarmed by "Row forward scan" in
+EXPLAIN - no column data is decoded for skipped frames.
+
+``time`` is the original behaviour: one preliminary query finds the range's min/max
+timestamp, which is cut into N equal time spans, one per reader. Equal *time*, not
+equal rows, so skew in the data's time distribution makes readers finish at wildly
+different times. Its one advantage is that the boundaries are absolute timestamps
+computed once, so all readers agree on them even if the table is being written to
+concurrently; row offsets are re-evaluated per connection and can shift under
+appends. Use ``time`` for a live table, ``rows`` for everything else.
 
 Auth / TLS (QuestDB Enterprise): pass ``--token`` (bearer) or ``--username``/``--password``
 (basic). Either turns on TLS automatically (scheme ``wss``); ``--tls`` forces TLS with
@@ -30,12 +55,14 @@ self-signed certs.
 Usage:
     python read_bench.py TABLE \
         [--addr host:9000] [--limit 10000000] [--readers 1] \
+        [--split rows|time] [--chunks N] \
         [--token TOK | --username U --password P] [--tls] [--tls-verify on|unsafe_off]
 
 Requires the questdb 5.0 client (see README.md).
 """
 
 import argparse
+import queue
 import sys
 import threading
 import time
@@ -69,9 +96,36 @@ def ns_to_iso(ns):
     return dt.strftime("%Y-%m-%dT%H:%M:%S") + f".{frac:09d}Z"
 
 
-def split_queries(args, conf):
-    """Build one SELECT per reader. For a single reader, the exact `limit -N`
-    query; for N readers, split the last-N rows' timestamp range into N slices."""
+def row_chunks(args):
+    """Build `--chunks` SELECTs covering the last `--limit` rows as equal row-count
+    slices, oldest first, using QuestDB's `LIMIT -m, -n`.
+
+    Per the LIMIT reference, `LIMIT -m, -n` takes the last m records then drops the
+    last n of those, i.e. the half-open range [-m, -n) - so consecutive chunks tile
+    the range with no gap and no overlap. The newest chunk has n == 0, which is the
+    documented `LIMIT -n, 0` == `LIMIT -n` form.
+
+    Needs no preliminary query: the bounds are arithmetic on --limit alone.
+    """
+    table, limit, chunks = args.table, args.limit, args.chunks
+    edges = [(limit * i) // chunks for i in range(chunks + 1)]
+    sqls = []
+    for i in range(chunks):
+        lo = limit - edges[i]          # rows from the end, inclusive start
+        hi = limit - edges[i + 1]      # rows from the end, exclusive end
+        if lo <= hi:                   # empty chunk (chunks > limit); nothing to read
+            continue
+        if hi == 0:
+            sqls.append(f"select * from {table} limit -{lo}")
+        else:
+            sqls.append(f"select * from {table} limit -{lo}, -{hi}")
+    return sqls
+
+
+def time_slices(args, conf):
+    """Build one SELECT per reader by splitting the last-N rows' timestamp range into
+    N equal time spans. Costs one preliminary query and assumes --timestamp-col names
+    the designated timestamp."""
     table, ts, limit, readers = args.table, args.timestamp_col, args.limit, args.readers
     if readers <= 1:
         return [f"select * from {table} limit -{limit}"]
@@ -100,24 +154,45 @@ def split_queries(args, conf):
     return sqls
 
 
-def run_reader(idx, sql, conf, counts, byts, errors, sample_n, sample_out):
+def run_reader(idx, work, conf, counts, byts, chunks_done, errors,
+               sample_n, sample_out, sample_lock):
+    """One worker: hold a single connection and drain chunks off `work` until empty.
+
+    `db.reader()` leases one pooled connection for the lease's lifetime and runs its
+    queries sequentially on it, so a worker is one connection no matter how many
+    chunks it processes. The lease must be used only on the thread that created it,
+    which is what this function is.
+    """
     try:
+        n = 0
+        b = 0
         with questdb.connect(conf) as db:
-            result = db.query(sql)
-            n = 0
-            b = 0
-            for batch in result.iter_arrow():
-                n += batch.num_rows        # count rows and decoded Arrow bytes
-                b += batch.nbytes          # (buffer bytes of this batch's columns)
-                if idx == 0 and sample_n > 0 and sample_out[0] is None:
-                    # Reuse the Arrow data we already received: wrap the first batch as a polars
-                    # DataFrame (zero-copy) and keep its head (one-off, no extra query, no re-scan).
-                    import polars as pl
-                    sample_out[0] = pl.from_arrow(batch).head(sample_n)
-                counts[idx] = n
-                byts[idx] = b
-            counts[idx] = n
-            byts[idx] = b
+            with db.reader() as reader:
+                while True:
+                    try:
+                        sql = work.get_nowait()
+                    except queue.Empty:
+                        break
+                    # Every chunk hits the same table and the same SYMBOL columns, so keep
+                    # the connection's symbol dictionary warm instead of rebuilding it per
+                    # chunk. On the lease's first query the dictionary is empty anyway.
+                    result = reader.query(sql, reset_symbol_dict=False)
+                    for batch in result.iter_arrow():
+                        n += batch.num_rows    # count rows and decoded Arrow bytes
+                        b += batch.nbytes      # (buffer bytes of this batch's columns)
+                        if sample_n > 0 and sample_out[0] is None:
+                            # Reuse Arrow data we already received: wrap the first batch any
+                            # worker sees as a polars DataFrame (zero-copy) and keep its head
+                            # (one-off, no extra query, no re-scan).
+                            with sample_lock:
+                                if sample_out[0] is None:
+                                    import polars as pl
+                                    sample_out[0] = pl.from_arrow(batch).head(sample_n)
+                        counts[idx] = n
+                        byts[idx] = b
+                    counts[idx] = n
+                    byts[idx] = b
+                    chunks_done[idx] += 1
     except Exception as e:  # noqa: BLE001
         errors.append(f"reader {idx}: {e}")
 
@@ -129,9 +204,19 @@ def main(argv):
     ap.add_argument("--limit", type=int, default=10_000_000,
                     help="number of most-recent rows to read; default 10,000,000")
     ap.add_argument("--readers", type=int, default=1,
-                    help="parallel reader connections (split by timestamp); default 1")
+                    help="parallel reader connections; default 1")
+    ap.add_argument("--split", choices=["rows", "time"], default="rows",
+                    help="how to divide the range: 'rows' (equal row counts via LIMIT "
+                         "offsets, striped over --chunks, no preliminary query) or "
+                         "'time' (equal timestamp spans, one slice per reader, needs a "
+                         "preliminary query but is stable under concurrent writes); "
+                         "default rows")
+    ap.add_argument("--chunks", type=int, default=0,
+                    help="number of row-offset chunks to stripe across readers "
+                         "(--split rows only); default 0 = readers * 8. More chunks "
+                         "balance better; each costs one extra query round trip")
     ap.add_argument("--timestamp-col", default="timestamp",
-                    help="designated timestamp column (used to split across readers)")
+                    help="designated timestamp column (--split time only)")
     ap.add_argument("--report-interval", type=float, default=0.5,
                     help="seconds between progress lines; default 0.5")
     ap.add_argument("--sample", type=int, default=5,
@@ -152,15 +237,27 @@ def main(argv):
     conf = build_conf(args)
     print(f"[conf]   {'wss' if use_tls(args) else 'ws'} tls={use_tls(args)} "
           f"auth={'token' if args.token else 'basic' if args.username else 'none'}")
-    sqls = split_queries(args, conf)
-    readers = len(sqls)
+    if args.split == "rows":
+        args.chunks = max(args.chunks or args.readers * 8, args.readers)
+        sqls = row_chunks(args)
+        readers = min(args.readers, len(sqls))
+    else:
+        sqls = time_slices(args, conf)
+        readers = len(sqls)   # time mode is one slice per reader, capped by fallbacks
+
+    work = queue.Queue()
+    for sql in sqls:
+        work.put(sql)
+
     print(f"[scan]   reading last {args.limit:,} rows of '{args.table}' "
-          f"across {readers} reader(s) ...")
+          f"across {readers} reader(s), {len(sqls)} {args.split} chunk(s) ...")
 
     counts = [0] * readers
     byts = [0] * readers
+    chunks_done = [0] * readers
     errors = []
-    sample_out = [None]   # reader 0 fills this with a few rows off its first Arrow batch
+    sample_out = [None]   # first Arrow batch any worker sees, as a few polars rows
+    sample_lock = threading.Lock()
     stop = threading.Event()
 
     def reporter():
@@ -179,9 +276,10 @@ def main(argv):
 
     t0 = time.monotonic()
     threads = []
-    for i, sql in enumerate(sqls):
+    for i in range(readers):
         t = threading.Thread(target=run_reader,
-                             args=(i, sql, conf, counts, byts, errors, args.sample, sample_out))
+                             args=(i, work, conf, counts, byts, chunks_done, errors,
+                                   args.sample, sample_out, sample_lock))
         t.start()
         threads.append(t)
     for t in threads:
@@ -208,7 +306,7 @@ def main(argv):
     print(f"[done]   {rate:,.0f} rows/s | {mbps:,.1f} MB/s | {gbps:.2f} Gb/s "
           f"(decoded Arrow payload, not wire bytes)")
     if readers > 1:
-        per = "  ".join(f"r{i}={c:,}" for i, c in enumerate(counts))
+        per = "  ".join(f"r{i}={c:,}({chunks_done[i]}ch)" for i, c in enumerate(counts))
         print(f"[done]   per-reader rows: {per}")
 
     # An extract of the data we actually received: a few rows sliced off the first Arrow batch
