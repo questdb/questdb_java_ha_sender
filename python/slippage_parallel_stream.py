@@ -31,8 +31,19 @@ import polars as pl
 import questdb
 
 READERS = int(sys.argv[1]) if len(sys.argv) > 1 else 8
-QUEUE_DEPTH = 4          # batches a worker may run ahead before it blocks
+QUEUE_DEPTH = 8          # batches a worker may run ahead before it blocks
 DONE = object()          # sentinel: this range produced its last batch
+
+# How many batches to render as full tables before switching to one line each.
+# This matters more than it looks. Because the queues are bounded, a worker blocks
+# once its queue is full, so the printer sets the pace for every fetcher: a slow
+# terminal throttles the whole pipeline. Rendering all ~730 batches of a 12M row
+# result emits ~3.7 MB of box-drawing tables, which is fine piped to a file and
+# painfully slow over SSH. Showing the first few in full and a compact line
+# thereafter keeps the streaming feel without putting the terminal in the critical
+# path. Set SLIPPAGE_FULL_FRAMES=0 for pure progress lines, or a big number to
+# render everything.
+FULL_FRAMES = int(os.environ.get("SLIPPAGE_FULL_FRAMES", "2"))
 
 SQL = """
 SELECT
@@ -106,6 +117,7 @@ def main():
                          daemon=True).start()
 
     rows = 0
+    shown = 0
     first = None
     for i, q in enumerate(queues):
         while True:
@@ -117,7 +129,9 @@ def main():
             rows += df.height
             print(f"--- range {i} | batch of {df.height:,} rows | {rows:,} so far ---",
                   flush=True)
-            print(df, flush=True)
+            if shown < FULL_FRAMES:
+                print(df, flush=True)
+                shown += 1
 
     elapsed = time.monotonic() - t0
     if errors:
