@@ -180,10 +180,14 @@ def run_reader(idx, work, conf, counts, byts, chunks_done, errors,
                     for batch in result.iter_arrow():
                         n += batch.num_rows    # count rows and decoded Arrow bytes
                         b += batch.nbytes      # (buffer bytes of this batch's columns)
-                        if sample_n > 0 and sample_out[0] is None:
-                            # Reuse Arrow data we already received: wrap the first batch any
-                            # worker sees as a polars DataFrame (zero-copy) and keep its head
-                            # (one-off, no extra query, no re-scan).
+                        # Reuse Arrow data we already received: wrap the first non-empty
+                        # batch any worker sees as a polars DataFrame (zero-copy) and keep
+                        # its head (one-off, no extra query, no re-scan). The num_rows test
+                        # is load-bearing: a chunk whose offsets fall past the end of the
+                        # table (--limit larger than the table) still yields a schema-only
+                        # batch of 0 rows, and those chunks finish first, so latching on any
+                        # first batch would print an empty sample with a correct schema.
+                        if sample_n > 0 and batch.num_rows > 0 and sample_out[0] is None:
                             with sample_lock:
                                 if sample_out[0] is None:
                                     import polars as pl
