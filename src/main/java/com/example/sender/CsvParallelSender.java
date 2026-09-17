@@ -743,6 +743,17 @@ public class CsvParallelSender {
             try {
                 final long[] latest = {Long.MIN_VALUE};
                 final boolean[] wasDown = {false};
+                // Consecutive failed ticks. The probe exists to show read HA, so an outage has
+                // to stay VISIBLE: reporting the loss once and then going quiet is
+                // indistinguishable from the probe thread having died, and it also hides WHY
+                // the reader is not picking up a replica. target defaults to any, so a replica
+                // is an acceptable endpoint and connect() walks the address list; if a read is
+                // not being served during a primary outage we need the per-attempt reason.
+                final long[] downTicks = {0L};
+                // Wall time the last successful connect() took. A dead endpoint that blackholes
+                // SYN burns the whole connect_timeout before the walk reaches the next address,
+                // so this is how you tell "failover is broken" from "failover is just slow".
+                final long[] connectMs = {0L};
                 // Set by the probe handler when the server reports a transport-level failure.
                 // Transport failures always carry STATUS_INTERNAL_ERROR; a SQL-level error
                 // (e.g. "table does not exist" before ingestion creates it) carries a different
@@ -843,20 +854,27 @@ public class CsvParallelSender {
                     targetRole[0] = null;
                     statusDiag[0] = null;
                     transportFailed[0] = false;
+                    final long tickStart = System.nanoTime();
                     try {
                         // (Re)build on first pass and after every connection loss. A server that
                         // is down at startup just leaves client == null and retries next tick.
                         if (client == null) {
+                            final long connectStart = System.nanoTime();
                             client = QwpQueryClient.fromConfig(queryClientConfig(cfg));
                             client.connect();
+                            connectMs[0] = (System.nanoTime() - connectStart) / 1_000_000L;
                             final QwpServerInfo info = client.getServerInfo();
-                            final String what = wasDown[0] ? "connection restored" : "connected";
+                            final String what = wasDown[0]
+                                    ? "connection restored after " + downTicks[0] + " failed attempt(s)"
+                                    : "connected";
+                            downTicks[0] = 0;
                             if (info != null) {
-                                System.out.printf("[query client] %s, serving node=%s role=%s zone=%s cluster=%s%n",
-                                        what, orNone(info.getNodeId()), QwpServerInfo.roleName(info.getRole()),
+                                System.out.printf("[query client] %s in %dms, serving node=%s role=%s zone=%s cluster=%s%n",
+                                        what, connectMs[0], orNone(info.getNodeId()),
+                                        QwpServerInfo.roleName(info.getRole()),
                                         orNone(info.getZoneId()), orNone(info.getClusterId()));
                             } else {
-                                System.out.printf("[query client] %s%n", what);
+                                System.out.printf("[query client] %s in %dms%n", what, connectMs[0]);
                             }
                             wasDown[0] = false;
                         }
@@ -910,21 +928,53 @@ public class CsvParallelSender {
                                     System.out.println("[probe] live role unavailable: " + statusDiag[0]);
                                 }
                             }
+                        } else if (!SUBMIT_COMPLETE) {
+                            // Connected and the query succeeded, but no row came back. Say so
+                            // rather than printing nothing, which would look identical to the
+                            // read being down.
+                            System.out.println("[probe] read OK but query returned no rows yet");
                         }
                     } catch (Exception e) {
+                        downTicks[0]++;
                         if (!wasDown[0]) {
                             System.out.printf("[query client] connection lost (%s), will retry%n",
                                     String.valueOf(e.getMessage()));
                             wasDown[0] = true;
                         }
+                        // Print EVERY failed attempt, not just the first. Reads are supposed to
+                        // survive a primary outage by moving to a replica, so each tick the read
+                        // is still down is the thing the demo needs to show, with the reason.
+                        if (!SUBMIT_COMPLETE) {
+                            System.out.printf("[probe] read DOWN, attempt %d failed after %dms: %s%n",
+                                    downTicks[0], (System.nanoTime() - tickStart) / 1_000_000L,
+                                    String.valueOf(e.getMessage()));
+                        }
                         // Drop the latched client; the next tick builds a fresh one.
+                        //
+                        // Dispose it on a throwaway thread rather than inline. close() joins the
+                        // client's I/O thread for up to shutdownJoinMs, which is a hardcoded 5s
+                        // (private, no setter and no connection-string key, still true in 1.3.9),
+                        // and a dead connection reliably hits that full timeout. Closing inline
+                        // therefore stalls this loop ~5s per failed tick, so the reader sits idle
+                        // while a live replica is right there waiting to serve -- which is exactly
+                        // why read failover looked broken. connect() itself walks every endpoint
+                        // and only gives up with "all QWP endpoints unreachable", so the failover
+                        // was never the problem; our teardown was.
+                        //
+                        // Safe to hand off: execute() has already returned, no handler is running,
+                        // and the next tick builds a SEPARATE instance that shares no state.
                         if (client != null) {
-                            try {
-                                client.close();
-                            } catch (Exception ignored) {
-                                // A dead connection often fails to close cleanly; nothing to do.
-                            }
+                            final QwpQueryClient dead = client;
                             client = null;
+                            final Thread reaper = new Thread(() -> {
+                                try {
+                                    dead.close();
+                                } catch (Exception ignored) {
+                                    // A dead connection often fails to close cleanly; nothing to do.
+                                }
+                            }, "qwp-probe-reaper");
+                            reaper.setDaemon(true);
+                            reaper.start();
                         }
                     }
                     Thread.sleep(intervalMs);
