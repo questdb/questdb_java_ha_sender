@@ -94,6 +94,11 @@ public class CsvParallelSender {
     // straight from the client (getAckedFsn / flushAndGetSequence) and are what the protocol
     // actually acknowledges, which is also what the client's own errors quote
     // ("targetFsn=10999, ackedFsn=5455"). No row-level ack figure is tracked: see reportTick().
+    //
+    // BOTH accessors use -1 as a sentinel: getAckedFsn() for "nothing acked yet" and
+    // flushAndGetSequence() for "nothing to flush". Neither may reach these fields, or it
+    // corrupts a sum and prints nonsense like "frames acked=-1/11". Clamp/guard at every
+    // assignment, not at the point of display.
     private static AtomicLong[] ACKED_FSN = new AtomicLong[0];
     private static AtomicLong[] PUBLISHED_FSN = new AtomicLong[0];
     // Set once all rows are submitted. Marks the append-phase boundary for timing; it does
@@ -242,9 +247,9 @@ public class CsvParallelSender {
         // slot, so this process's own counters cannot describe it.
         final long sfStartBytes = sfDirBytes(storeForwardDir);
         if (sfStartBytes > 0) {
-            System.out.printf("[store-and-forward] found %s of pending frames in %s; "
-                            + "REPLAYING previous run's unacked data before new sends%n",
-                    humanBytes(sfStartBytes), storeForwardDir);
+            banner("STORE-AND-FORWARD REPLAY ON STARTUP",
+                    humanBytes(sfStartBytes) + " of pending frames in " + storeForwardDir,
+                    "a previous run left this unacked; it replays before new sends");
         }
 
         // Records (to ~1s resolution) when all rows were submitted and when all were acknowledged,
@@ -256,6 +261,11 @@ public class CsvParallelSender {
         // run ahead of the server) and acknowledged (rows the server has actually committed). The
         // gap between them is the buffered backlog; during the drain, submitted is flat while
         // acknowledged keeps climbing (real work), so there is no misleading "0 rows/s".
+        // Rows between flushes, i.e. how often a frame is published. Mirrors runWorker's
+        // commitEveryRows so the progress line can name the threshold.
+        final long flushEveryRows = protocol.equals("qwp")
+                ? (long) batchSize * batchesPerTransaction
+                : 0L;
         final long[] lastSfBytes = {sfStartBytes};
         final Thread reporter = new Thread(() -> {
             long lastSub = 0;
@@ -266,7 +276,8 @@ public class CsvParallelSender {
                     return;
                 }
                 try {
-                    reportTick(totalEvents, storeForwardDir, appendDoneNanos, lastSfBytes, lastSub);
+                    reportTick(totalEvents, storeForwardDir, flushEveryRows,
+                            appendDoneNanos, lastSfBytes, lastSub);
                     lastSub = TOTAL_SENT.get();
                 } catch (RuntimeException e) {
                     // Never let one bad tick silence progress for the rest of the run. A dead
@@ -404,7 +415,7 @@ public class CsvParallelSender {
                         if (fsn >= 0) {
                             PUBLISHED_FSN[senderId].set(fsn);
                         }
-                        ACKED_FSN[senderId].set(sender.getAckedFsn());
+                        ACKED_FSN[senderId].set(Math.max(0L, sender.getAckedFsn()));
                     } else {
                         sender.flush();
                     }
@@ -459,7 +470,7 @@ public class CsvParallelSender {
                 boolean drained = false;
                 while (System.nanoTime() < drainDeadline) {
                     drained = sender.drain(DRAIN_SLICE_MS);
-                    ACKED_FSN[senderId].set(sender.getAckedFsn());
+                    ACKED_FSN[senderId].set(Math.max(0L, sender.getAckedFsn()));
                     if (drained) {
                         break;
                     }
@@ -504,7 +515,7 @@ public class CsvParallelSender {
     // should have been "unknown" on a resumed slot, a -1 sentinel poisoning the map so a 19,579
     // frame run reported 100,000,000 rows acked, and the same sentinel printing "/-1" as a
     // denominator. Frames and bytes have never been wrong. Rows are gone.
-    private static void reportTick(long totalEvents, String storeForwardDir,
+    private static void reportTick(long totalEvents, String storeForwardDir, long commitEveryRows,
                                    AtomicLong appendDoneNanos, long[] lastSfBytes, long lastSub) {
         final long sub = TOTAL_SENT.get();
         if (sub >= totalEvents) {
@@ -523,17 +534,33 @@ public class CsvParallelSender {
                 anyPublished = true;
             }
         }
-        System.out.printf("[progress] submitted=%,d (+%,d/s) | frames acked=%s%n",
-                sub, sub - lastSub,
-                anyPublished ? String.format("%,d/%,d", ackedFsn, publishedFsn)
-                             : String.format("%,d/pending", ackedFsn));
+        if (commitEveryRows <= 0) {
+            // Not QWP: no frame sequence numbers and no acks to report (UDP is fire-and-forget,
+            // ILP auto-flushes over HTTP), so the frames field would be meaningless.
+            System.out.printf("[progress] submitted=%,d (+%,d/s)%n", sub, sub - lastSub);
+        } else {
+            System.out.printf("[progress] submitted=%,d (+%,d/s) | frames acked=%s%n",
+                    sub, sub - lastSub,
+                    anyPublished
+                            ? String.format("%,d/%,d", ackedFsn, publishedFsn)
+                            // No frame published yet, which is normal early on: a flush happens
+                            // every batch-size x batches-per-transaction rows, so at a paced feed
+                            // the first one can be many seconds away. Name the threshold rather
+                            // than leaving a bare "pending" to be reverse-engineered.
+                            : String.format("none yet, first flush at %,d rows", commitEveryRows));
+        }
 
         // Watch the spill shrink. Reported only while there is something there, so a healthy run
         // with no backlog stays quiet.
-        final long sfNow = sfDirBytes(storeForwardDir);
+        final long[] sfStats = sfDirStats(storeForwardDir);
+        final long sfNow = sfStats[0];
         if (sfNow > 0) {
-            System.out.printf("[store-and-forward] backlog on disk: %s%s%n",
-                    humanBytes(sfNow),
+            // Bytes are ALLOCATED, not used: segments are memory-mapped and pre-allocated to
+            // sf_max_segment_bytes (4 MiB by default), so a run holding a few hundred KB still
+            // shows a whole segment. The file count makes that readable at demo scale, and both
+            // figures stay meaningful once a real backlog builds.
+            System.out.printf("[store-and-forward] spill: %s allocated in %,d segment file(s)%s%n",
+                    humanBytes(sfNow), sfStats[1],
                     lastSfBytes[0] > 0 && sfNow != lastSfBytes[0]
                             ? String.format(" (%+.1f MiB/s)",
                                 (sfNow - lastSfBytes[0]) / (1024.0 * 1024.0))
@@ -546,28 +573,54 @@ public class CsvParallelSender {
     // event and no backlog metric, so the filesystem is the only observable signal that a
     // restart is replaying a previous run's unacked frames. Cheap enough to sample once a
     // second: a few hundred segment files.
-    private static long sfDirBytes(String dir) {
+    // Rule width for the attention banners below. The events they wrap (a write failing over to
+    // another node, reads moving to a replica, a spilled backlog replaying) are the whole point of
+    // an HA demo, and as ordinary one-line output they scrolled past unnoticed among per-second
+    // progress lines.
+    private static final String BANNER_RULE =
+            "############################################################################";
+
+    private static void banner(String... lines) {
+        final StringBuilder sb = new StringBuilder();
+        sb.append('\n').append(BANNER_RULE).append('\n');
+        for (String line : lines) {
+            sb.append("###  ").append(line).append('\n');
+        }
+        sb.append(BANNER_RULE).append('\n');
+        // One write, so the banner cannot be interleaved by the reporter or probe threads.
+        System.out.print(sb);
+    }
+
+    // {bytes, fileCount} for the spill root, from a SINGLE walk: two separate traversals a
+    // second apart could disagree with each other while segments rotate.
+    private static long[] sfDirStats(String dir) {
         final Path root = Path.of(dir);
         if (!Files.exists(root)) {
-            return 0L;
+            return new long[]{0L, 0L};
         }
+        long bytes = 0L;
+        long count = 0L;
         try (java.util.stream.Stream<Path> walk = Files.walk(root)) {
-            return walk.filter(Files::isRegularFile).mapToLong(f -> {
+            for (Path f : (Iterable<Path>) walk.filter(Files::isRegularFile)::iterator) {
                 try {
-                    return Files.size(f);
+                    bytes += Files.size(f);
+                    count++;
                 } catch (IOException | RuntimeException ignored) {
-                    return 0L;   // segment reclaimed mid-walk; it simply no longer counts
+                    // Segment reclaimed mid-walk; it simply no longer counts.
                 }
-            }).sum();
+            }
         } catch (IOException | RuntimeException e) {
-            // Files.walk wraps a mid-iteration failure in UncheckedIOException, which is a
-            // RuntimeException and so slips past `catch (IOException)`. Store-and-forward
-            // creates and reclaims segments continuously, so entries really do vanish under
-            // the walk. Letting that escape killed the reporter thread outright: progress
-            // lines stopped dead at the moment an outage began and spill writes surged, while
-            // the probe (a different thread) kept going, which looked like the gate bug again.
-            return 0L;
+            // Files.walk wraps a mid-iteration failure in UncheckedIOException, a RuntimeException
+            // that slips past catch (IOException). Store-and-forward reclaims segments
+            // continuously, so entries really do vanish under the walk, and letting that escape
+            // once killed the reporter thread outright.
+            return new long[]{bytes, count};
         }
+        return new long[]{bytes, count};
+    }
+
+    private static long sfDirBytes(String dir) {
+        return sfDirStats(dir)[0];
     }
 
     private static String humanBytes(long bytes) {
@@ -767,16 +820,20 @@ public class CsvParallelSender {
                     ? String.valueOf(event.getCause().getMessage()) : "no detail";
             final String msg;
             boolean noisy = false;
+            // Wrap in a banner: a write path moving to another node is a headline event.
+            boolean prominent = false;
             switch (event.getKind()) {
                 case CONNECTED:
                     msg = "connected to " + host;
                     break;
                 case RECONNECTED:
                     msg = "reconnected to " + host + backlogNote(cfg.storeForwardDir);
+                    prominent = true;
                     break;
                 case FAILED_OVER:
                     msg = "failed over " + event.getPreviousHost() + ":" + event.getPreviousPort()
                             + " -> " + host + backlogNote(cfg.storeForwardDir);
+                    prominent = true;
                     break;
                 case AUTH_FAILED:
                     msg = "auth failed for " + host;
@@ -808,7 +865,11 @@ public class CsvParallelSender {
                 }
                 lastNoisyMs[0] = now;
             }
-            System.out.printf("[ingestion client %s] %s%n", who, msg);
+            if (prominent) {
+                banner("INGESTION " + msg, "sender=" + who);
+            } else {
+                System.out.printf("[ingestion client %s] %s%n", who, msg);
+            }
         };
 
         // Enterprise-only: hold spilled frames until a durable (committed) ack. OSS servers
@@ -944,8 +1005,11 @@ public class CsvParallelSender {
 
                     @Override
                     public void onFailoverReset(QwpServerInfo info) {
-                        System.out.printf("[query client] failed over -> now serving node=%s role=%s zone=%s%n",
-                                orNone(info.getNodeId()), QwpServerInfo.roleName(info.getRole()), orNone(info.getZoneId()));
+                        // Reads surviving an outage by moving to another node is THE thing an HA
+                        // demo is showing, so it gets a banner rather than one line among many.
+                        banner("READS FAILED OVER -- now served by role=" + QwpServerInfo.roleName(info.getRole()),
+                                "node=" + orNone(info.getNodeId()) + " zone=" + orNone(info.getZoneId()),
+                                "queries keep being answered; only writes need a primary");
                     }
                 };
                 // `switch status` reports the serving node's LIVE lifecycle role: current_role, plus
