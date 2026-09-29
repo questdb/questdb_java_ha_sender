@@ -65,6 +65,14 @@ public class CsvParallelSender {
     private static final int DEFAULT_BATCHES_PER_TRANSACTION = 10;
     // Probe (QWP only): poll the latest ingested timestamp on an interval, 0 disables.
     private static final long DEFAULT_PROBE_INTERVAL_MS = 1000L;
+    // Slice length for the polled final drain. Short enough that the once-per-second reporter
+    // and probe keep ticking through it, long enough not to spin.
+    private static final long DRAIN_SLICE_MS = 1000L;
+    // close()'s own implicit drain budget. Deliberately LOW, not aligned to --retry-timeout:
+    // the polled drain above has already waited, and anything still unacked is recovered by the
+    // next sender in store-and-forward mode, so blocking again in close() buys no durability
+    // and only delays shutdown. Override with --close-flush-timeout-ms.
+    private static final long DEFAULT_CLOSE_FLUSH_TIMEOUT_MS = 5_000L;
     private static final String PROBE_QUERY = "select timestamp from trades limit -1";
     // Enterprise lifecycle status of whichever node the query client is currently connected to.
     // Returns the LIVE role (columns like current_role / target_role), unlike the QWP handshake
@@ -82,20 +90,15 @@ public class CsvParallelSender {
 
     // Rows sent (client-side) across all workers, for the once-per-second progress reporter.
     private static final AtomicLong TOTAL_SENT = new AtomicLong();
-    // Rows the server has acknowledged, per worker (summed by the reporter). Fed from the QWP
-    // ack watermark (getAckedFsn) - the real committed count, with no extra query round-trips.
-    private static AtomicLong[] ACKED_ROWS = new AtomicLong[0];
+    // The ack watermark and the highest published frame sequence, per worker. These come
+    // straight from the client (getAckedFsn / flushAndGetSequence) and are what the protocol
+    // actually acknowledges, which is also what the client's own errors quote
+    // ("targetFsn=10999, ackedFsn=5455"). No row-level ack figure is tracked: see reportTick().
+    private static AtomicLong[] ACKED_FSN = new AtomicLong[0];
+    private static AtomicLong[] PUBLISHED_FSN = new AtomicLong[0];
     // Set once all rows are submitted. Marks the append-phase boundary for timing; it does
     // NOT silence output, because submission finishing is not the end of the story.
     private static volatile boolean SUBMIT_COMPLETE = false;
-    // Set once the ack watermark has caught up with every submitted row. THIS is what
-    // silences the per-second progress + probe lines, so only the final summary follows.
-    // Gating on SUBMIT_COMPLETE instead was wrong: with store-and-forward, an outage can
-    // leave tens of millions of rows buffered after the last submit, and that drain is
-    // exactly what a durability demo needs to show. A real run went quiet at
-    // acknowledged=63.9M of 100M, hiding both the remaining acks and the fact that reads
-    // were still being served off a replica throughout.
-    private static volatile boolean ALL_ACKED = false;
 
     public static void main(String[] args) throws Exception {
         // Parse CLI flags
@@ -121,6 +124,8 @@ public class CsvParallelSender {
         final int batchSize = Integer.parseInt(a.getOrDefault("--batch-size", String.valueOf(DEFAULT_BATCH_SIZE)));
         final int batchesPerTransaction = Integer.parseInt(a.getOrDefault("--batches-per-transaction",
                 String.valueOf(DEFAULT_BATCHES_PER_TRANSACTION)));
+        final long closeFlushTimeoutMs = Long.parseLong(a.getOrDefault("--close-flush-timeout-ms",
+                String.valueOf(DEFAULT_CLOSE_FLUSH_TIMEOUT_MS)));
         final long probeIntervalMs = Long.parseLong(a.getOrDefault("--probe-interval-ms",
                 String.valueOf(DEFAULT_PROBE_INTERVAL_MS)));
         // Enterprise-only: request durable acks (data durably uploaded). OSS servers do not
@@ -188,7 +193,7 @@ public class CsvParallelSender {
 
         final SenderCfg cfg = new SenderCfg(protocol, addrsCsv, token, username, password, retryTimeout,
                 senderIdBase, storeForwardDir, batchSize, batchesPerTransaction, numSenders, enterprise, zone,
-                connectTimeoutMs, rate);
+                connectTimeoutMs, closeFlushTimeoutMs, rate);
 
         final String pacing = rate > 0
                 ? "rate=" + rate + " rows/s (aggregate across " + numSenders + " workers)"
@@ -223,16 +228,18 @@ public class CsvParallelSender {
 
         // Per-worker acknowledged-row counters, summed by the reporter. Fed from the QWP ack
         // watermark (getAckedFsn) - the real committed progress, with no extra query round-trips.
-        ACKED_ROWS = new AtomicLong[numSenders];
+        ACKED_FSN = new AtomicLong[numSenders];
+        PUBLISHED_FSN = new AtomicLong[numSenders];
         for (int i = 0; i < numSenders; i++) {
-            ACKED_ROWS[i] = new AtomicLong();
+            ACKED_FSN[i] = new AtomicLong();
+            PUBLISHED_FSN[i] = new AtomicLong();
         }
 
         // A non-empty store-and-forward root at startup means a previous run died holding
         // unacked frames. The client replays them before (and alongside) new sends, and that
         // replay is otherwise invisible: it shows up only as seconds of submitted=0 with the
         // acked counter pinned at zero, because the backlog belongs to the previous process's
-        // slot and never passes through ACKED_ROWS.
+        // slot, so this process's own counters cannot describe it.
         final long sfStartBytes = sfDirBytes(storeForwardDir);
         if (sfStartBytes > 0) {
             System.out.printf("[store-and-forward] found %s of pending frames in %s; "
@@ -252,49 +259,22 @@ public class CsvParallelSender {
         final long[] lastSfBytes = {sfStartBytes};
         final Thread reporter = new Thread(() -> {
             long lastSub = 0;
-            long lastAck = 0;
             while (true) {
                 try {
                     Thread.sleep(1000);
                 } catch (InterruptedException ie) {
                     return;
                 }
-                final long sub = TOTAL_SENT.get();
-                long ack = 0;
-                for (AtomicLong al : ACKED_ROWS) {
-                    ack += al.get();
+                try {
+                    reportTick(totalEvents, storeForwardDir, appendDoneNanos, lastSfBytes, lastSub);
+                    lastSub = TOTAL_SENT.get();
+                } catch (RuntimeException e) {
+                    // Never let one bad tick silence progress for the rest of the run. A dead
+                    // reporter looks exactly like a stalled sender, and that ambiguity cost real
+                    // debugging time when an UncheckedIOException from the spill walk killed
+                    // this thread mid-outage.
+                    System.out.printf("[progress] reporter tick failed: %s%n", e);
                 }
-                if (sub >= totalEvents) {
-                    appendDoneNanos.compareAndSet(0, System.nanoTime());
-                    SUBMIT_COMPLETE = true;
-                }
-                if (ack >= totalEvents) {
-                    commitDoneNanos.compareAndSet(0, System.nanoTime());
-                    ALL_ACKED = true;
-                }
-                // Go quiet only once the ACKS have caught up, not merely once submission has.
-                // The drain after the last submit is where store-and-forward earns its keep, so
-                // keep reporting it. The final "All workers completed ..." summary is still the
-                // single last line.
-                if (ALL_ACKED) {
-                    continue;
-                }
-                System.out.printf("[progress] submitted=%,d (+%,d/s) | acknowledged=%,d (+%,d/s)%n",
-                        sub, sub - lastSub, ack, ack - lastAck);
-                lastSub = sub;
-                lastAck = ack;
-                // Watch the spill shrink. Only reported while there is something there, so a
-                // healthy run with no backlog stays quiet.
-                final long sfNow = sfDirBytes(storeForwardDir);
-                if (sfNow > 0) {
-                    System.out.printf("[store-and-forward] backlog on disk: %s%s%n",
-                            humanBytes(sfNow),
-                            lastSfBytes[0] > 0 && sfNow != lastSfBytes[0]
-                                    ? String.format(" (%+.1f MiB/s)",
-                                        (sfNow - lastSfBytes[0]) / (1024.0 * 1024.0))
-                                    : "");
-                }
-                lastSfBytes[0] = sfNow;
             }
         });
         reporter.setDaemon(true);
@@ -381,9 +361,6 @@ public class CsvParallelSender {
                 : 0.0;
         final boolean rateLimited = intervalNanos > 0.0;
         final long paceStartNanos = System.nanoTime();
-        // QWP ack tracking: map each flush sequence -> cumulative rows, so getAckedFsn() can be
-        // resolved to acknowledged rows. Only QWP carries frame sequence numbers and acks.
-        final java.util.TreeMap<Long, Long> fsnToRows = isQwp ? new java.util.TreeMap<>() : null;
         try ( Sender sender = buildSender(cfg, senderId)) { //( Sender sender = Sender.fromConfig(conf)) {
             final int n = rows.size();
             for (long i = 0; i < totalEvents; i++) {
@@ -421,8 +398,13 @@ public class CsvParallelSender {
                 // worker's acknowledged-row count from the ack watermark (no extra round-trip).
                 if (commitEveryRows > 0 && sent % commitEveryRows == 0) {
                     if (isQwp) {
-                        fsnToRows.put(sender.flushAndGetSequence(), sent);
-                        ACKED_ROWS[senderId].set(ackedRows(sender, fsnToRows));
+                        // flushAndGetSequence() returns -1 when there was nothing left to
+                        // flush; storing that would clobber the real published frame.
+                        final long fsn = sender.flushAndGetSequence();
+                        if (fsn >= 0) {
+                            PUBLISHED_FSN[senderId].set(fsn);
+                        }
+                        ACKED_FSN[senderId].set(sender.getAckedFsn());
                     } else {
                         sender.flush();
                     }
@@ -452,39 +434,112 @@ public class CsvParallelSender {
                     }
                 }
             }
-            // Final flush. For QWP, wait for the server to acknowledge everything so the acked
-            // counter climbs to the full count during the drain (the real committed progress). The
-            // await loop drives the connection and refreshes the counter; capped to avoid a hang.
+            // Final drain, done HERE rather than inside close(), and in slices so it stays
+            // observable.
+            //
+            // close() runs its own implicit drain bounded by close_flush_timeout_millis
+            // (default 60s), which is independent of --retry-timeout: a longer outage used to
+            // die with "close() drain timed out ... data may be lost" while still holding
+            // minutes of unused reconnect budget. Worse, while blocked inside close() nothing
+            // can refresh the acked counter or the probe, so the most interesting window of a
+            // durability demo was invisible.
+            //
+            // Sender.drain(timeoutMillis) is the documented way to take that wait back: "the
+            // same shape as the implicit drain close() runs, with the caller controlling the
+            // timeout per call-site". Polling it in ~1s slices lets the reporter and the probe
+            // keep working, and the counter climb, for the whole drain. The budget is
+            // --retry-timeout, so there is now ONE timeout governing how long we wait for the
+            // server rather than two that disagree.
             if (isQwp) {
                 final long finalSeq = sender.flushAndGetSequence();
-                fsnToRows.put(finalSeq, sent);
-                final long drainDeadline = System.nanoTime() + 600_000_000_000L; // 10 min cap
-                while (!sender.awaitAckedFsn(finalSeq, 200L) && System.nanoTime() < drainDeadline) {
-                    ACKED_ROWS[senderId].set(ackedRows(sender, fsnToRows));
+                if (finalSeq >= 0) {
+                    PUBLISHED_FSN[senderId].set(finalSeq);
                 }
-                // Re-read once on exit. awaitAckedFsn returning true breaks the loop BEFORE the
-                // body runs again, so without this the counter keeps whatever the last iteration
-                // left and under-reports for the rest of the run (observed: stuck at 15,300,000
-                // of 30,000,000 while the server had in fact acked everything).
-                ACKED_ROWS[senderId].set(ackedRows(sender, fsnToRows));
+                final long drainDeadline = System.nanoTime() + cfg.retryTimeout * 1_000_000L;
+                boolean drained = false;
+                while (System.nanoTime() < drainDeadline) {
+                    drained = sender.drain(DRAIN_SLICE_MS);
+                    ACKED_FSN[senderId].set(sender.getAckedFsn());
+                    if (drained) {
+                        break;
+                    }
+                }
+                if (!drained) {
+                    // Not fatal: with store-and-forward the unacked remainder stays on disk and
+                    // the next sender replays it (Sender.closeFlushTimeoutMillis javadoc:
+                    // "recovered by the next sender in SF mode"). Say so plainly instead of
+                    // letting close() raise "data may be lost" for data that is not lost.
+                    //
+                    System.out.printf("Sender %d drain budget of %,dms elapsed; frames %,d/%,d "
+                                    + "acked, %s still spilled. It stays in %s and replays on "
+                                    + "next start%n",
+                            senderId, cfg.retryTimeout,
+                            ACKED_FSN[senderId].get(), PUBLISHED_FSN[senderId].get(),
+                            humanBytes(sfDirBytes(cfg.storeForwardDir)),
+                            cfg.storeForwardDir + "/" + senderId);
+                }
             } else {
                 sender.flush();
             }
-            // Deliberately NOT setting ACKED_ROWS to `sent` here, and deliberately not printing
-            // "finished" yet. The try-with-resources close() below is where the bulk of the
-            // durability wait actually happens: measured locally, awaitAckedFsn above returned
-            // almost immediately while close() took 12.8s of a 19.8s run. Claiming every row was
-            // acked before that wait made the reporter believe the run was done, which silenced
-            // both the progress line and the read probe for the whole drain -- the exact window a
-            // durability demo needs to show.
+            // "finished" is deliberately NOT printed yet. The try-with-resources close() below
+            // still runs (briefly, per --close-flush-timeout-ms), and announcing completion
+            // before it returns would be premature.
         } catch (Exception e) {
             System.err.printf("Sender %d got error: %s%s%n", senderId, e.toString(), upgradeHint(e));
             throw new RuntimeException(e);
         }
-        // Reached only after close() returned, i.e. after the real drain. Now the full count is
-        // true rather than aspirational.
-        ACKED_ROWS[senderId].set(sent);
+        // Reached only after close() returned.
         System.out.printf("Sender %d finished sending %d events%n", senderId, sent);
+    }
+
+    // One progress tick. Everything here is MEASURED, nothing is inferred:
+    //   submitted    - our own counter of rows handed to the client
+    //   frames acked - the client's ack watermark against the highest frame it published
+    //   backlog      - bytes actually on disk in the store-and-forward root
+    //
+    // There is deliberately no row-level "acknowledged" figure. Translating the frame watermark
+    // back into rows needed a side map of fsn -> cumulative rows, and that translation produced
+    // six distinct wrong answers during development: premature saturation before close(),
+    // 100,000-row quantisation, a gate that silenced this reporter 7s into a 98s drain, a 0 that
+    // should have been "unknown" on a resumed slot, a -1 sentinel poisoning the map so a 19,579
+    // frame run reported 100,000,000 rows acked, and the same sentinel printing "/-1" as a
+    // denominator. Frames and bytes have never been wrong. Rows are gone.
+    private static void reportTick(long totalEvents, String storeForwardDir,
+                                   AtomicLong appendDoneNanos, long[] lastSfBytes, long lastSub) {
+        final long sub = TOTAL_SENT.get();
+        if (sub >= totalEvents) {
+            appendDoneNanos.compareAndSet(0, System.nanoTime());
+            SUBMIT_COMPLETE = true;
+        }
+
+        long ackedFsn = 0;
+        long publishedFsn = 0;
+        boolean anyPublished = false;
+        for (int i = 0; i < ACKED_FSN.length; i++) {
+            ackedFsn += ACKED_FSN[i].get();
+            final long pub = PUBLISHED_FSN[i].get();
+            if (pub > 0) {
+                publishedFsn += pub;
+                anyPublished = true;
+            }
+        }
+        System.out.printf("[progress] submitted=%,d (+%,d/s) | frames acked=%s%n",
+                sub, sub - lastSub,
+                anyPublished ? String.format("%,d/%,d", ackedFsn, publishedFsn)
+                             : String.format("%,d/pending", ackedFsn));
+
+        // Watch the spill shrink. Reported only while there is something there, so a healthy run
+        // with no backlog stays quiet.
+        final long sfNow = sfDirBytes(storeForwardDir);
+        if (sfNow > 0) {
+            System.out.printf("[store-and-forward] backlog on disk: %s%s%n",
+                    humanBytes(sfNow),
+                    lastSfBytes[0] > 0 && sfNow != lastSfBytes[0]
+                            ? String.format(" (%+.1f MiB/s)",
+                                (sfNow - lastSfBytes[0]) / (1024.0 * 1024.0))
+                            : "");
+        }
+        lastSfBytes[0] = sfNow;
     }
 
     // Bytes currently spilled under the store-and-forward root. The client exposes no replay
@@ -500,11 +555,17 @@ public class CsvParallelSender {
             return walk.filter(Files::isRegularFile).mapToLong(f -> {
                 try {
                     return Files.size(f);
-                } catch (IOException ignored) {
+                } catch (IOException | RuntimeException ignored) {
                     return 0L;   // segment reclaimed mid-walk; it simply no longer counts
                 }
             }).sum();
-        } catch (IOException e) {
+        } catch (IOException | RuntimeException e) {
+            // Files.walk wraps a mid-iteration failure in UncheckedIOException, which is a
+            // RuntimeException and so slips past `catch (IOException)`. Store-and-forward
+            // creates and reclaims segments continuously, so entries really do vanish under
+            // the walk. Letting that escape killed the reporter thread outright: progress
+            // lines stopped dead at the moment an outage began and spill writes surged, while
+            // the probe (a different thread) kept going, which looked like the gate bug again.
             return 0L;
         }
     }
@@ -525,27 +586,15 @@ public class CsvParallelSender {
     // Unacked rows still owed to the server, i.e. what store-and-forward has to replay. The client
     // exposes no replay event: SenderConnectionEvent.Kind carries only CONNECTED, DISCONNECTED,
     // RECONNECTED, FAILED_OVER, ENDPOINT_ATTEMPT_FAILED, ALL_ENDPOINTS_UNREACHABLE and AUTH_FAILED,
-    // and bufferView() is just the unflushed local buffer, not the spilled backlog. So derive the
-    // figure from our own counters and announce it on reconnect; the acknowledged counter then
-    // climbing in the progress lines IS the replay.
-    private static String backlogNote() {
-        long acked = 0;
-        for (AtomicLong al : ACKED_ROWS) {
-            acked += al.get();
-        }
-        final long backlog = TOTAL_SENT.get() - acked;
-        if (backlog <= 0) {
+    // and bufferView() is just the unflushed local buffer, not the spilled backlog. So report the
+    // spill's size on disk, which is measured rather than inferred; the backlog shrinking in the
+    // per-tick lines afterwards IS the replay.
+    private static String backlogNote(String storeForwardDir) {
+        final long bytes = sfDirBytes(storeForwardDir);
+        if (bytes <= 0) {
             return "";
         }
-        return String.format(" -- REPLAYING store-and-forward backlog of %,d row(s)", backlog);
-    }
-
-    // Rows the server has acknowledged for this sender: map the ack watermark (getAckedFsn) back to
-    // the cumulative row count recorded at the latest fully-acknowledged flush. Zero round-trips -
-    // the ack watermark rides the ingest connection.
-    private static long ackedRows(Sender sender, java.util.TreeMap<Long, Long> fsnToRows) {
-        final java.util.Map.Entry<Long, Long> e = fsnToRows.floorEntry(sender.getAckedFsn());
-        return e != null ? e.getValue() : 0L;
+        return String.format(" -- REPLAYING store-and-forward backlog of %s", humanBytes(bytes));
     }
 
     // Send the designated timestamp at NANOSECOND resolution. The client's at(Instant) path
@@ -723,11 +772,11 @@ public class CsvParallelSender {
                     msg = "connected to " + host;
                     break;
                 case RECONNECTED:
-                    msg = "reconnected to " + host + backlogNote();
+                    msg = "reconnected to " + host + backlogNote(cfg.storeForwardDir);
                     break;
                 case FAILED_OVER:
                     msg = "failed over " + event.getPreviousHost() + ":" + event.getPreviousPort()
-                            + " -> " + host + backlogNote();
+                            + " -> " + host + backlogNote(cfg.storeForwardDir);
                     break;
                 case AUTH_FAILED:
                     msg = "auth failed for " + host;
@@ -772,6 +821,12 @@ public class CsvParallelSender {
         if (cfg.connectTimeoutMs > 0) {
             b.connectTimeoutMillis(cfg.connectTimeoutMs);
         }
+
+        // Keep close() from re-running a long implicit drain. runWorker() already drained in
+        // observable slices against --retry-timeout, and whatever is still unacked is replayed by
+        // the next sender from the spill directory, so a long close only delays shutdown and
+        // produces a "data may be lost" error for data that is not lost. 0 opts out entirely.
+        b.closeFlushTimeoutMillis(cfg.closeFlushTimeoutMs);
 
         return b.storeAndForwardDir(sfPath)
                 .senderId(who)
@@ -1189,6 +1244,7 @@ public class CsvParallelSender {
                 case "--batch-size":
                 case "--batches-per-transaction":
                 case "--probe-interval-ms":
+                case "--close-flush-timeout-ms":
                 case "--connect-timeout-ms":
                 case "--enterprise":
                 case "--zone":
@@ -1229,13 +1285,16 @@ public class CsvParallelSender {
         final boolean enterprise;
         final String zone;
         final int connectTimeoutMs;
+        // close()'s implicit drain budget. Separate from retryTimeout on purpose: our own polled
+        // drain owns the waiting, so this only bounds shutdown.
+        final long closeFlushTimeoutMs;
         // Target aggregate rows/second across all workers; 0 = disabled (use delayMs).
         final long rate;
 
         SenderCfg(String protocol, String addrsCsv, String token, String username, String password,
                   int retryTimeout, String senderIdBase, String storeForwardDir,
                   int batchSize, int batchesPerTransaction, int numSenders, boolean enterprise, String zone,
-                  int connectTimeoutMs, long rate) {
+                  int connectTimeoutMs, long closeFlushTimeoutMs, long rate) {
             this.protocol = protocol;
             this.addrsCsv = addrsCsv;
             this.token = token;
@@ -1250,6 +1309,7 @@ public class CsvParallelSender {
             this.enterprise = enterprise;
             this.zone = zone;
             this.connectTimeoutMs = connectTimeoutMs;
+            this.closeFlushTimeoutMs = closeFlushTimeoutMs;
             this.rate = rate;
         }
     }
