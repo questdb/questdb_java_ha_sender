@@ -580,13 +580,23 @@ public class CsvParallelSender {
     private static final String BANNER_RULE =
             "############################################################################";
 
+    // Rule lines above and below the message. Three each side, not one: a single rule still got
+    // lost in the scroll of per-second progress and probe lines during a live demo.
+    private static final int BANNER_RULE_LINES = 3;
+
     private static void banner(String... lines) {
         final StringBuilder sb = new StringBuilder();
-        sb.append('\n').append(BANNER_RULE).append('\n');
+        sb.append('\n');
+        for (int i = 0; i < BANNER_RULE_LINES; i++) {
+            sb.append(BANNER_RULE).append('\n');
+        }
         for (String line : lines) {
             sb.append("###  ").append(line).append('\n');
         }
-        sb.append(BANNER_RULE).append('\n');
+        for (int i = 0; i < BANNER_RULE_LINES; i++) {
+            sb.append(BANNER_RULE).append('\n');
+        }
+        sb.append('\n');
         // One write, so the banner cannot be interleaved by the reporter or probe threads.
         System.out.print(sb);
     }
