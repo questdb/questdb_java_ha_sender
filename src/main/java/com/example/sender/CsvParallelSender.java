@@ -84,9 +84,17 @@ public class CsvParallelSender {
     // Rows the server has acknowledged, per worker (summed by the reporter). Fed from the QWP
     // ack watermark (getAckedFsn) - the real committed count, with no extra query round-trips.
     private static AtomicLong[] ACKED_ROWS = new AtomicLong[0];
-    // Set once all rows are submitted: silences the per-second progress + probe lines so the
-    // commit-drain tail is quiet and only the final summary line is printed.
+    // Set once all rows are submitted. Marks the append-phase boundary for timing; it does
+    // NOT silence output, because submission finishing is not the end of the story.
     private static volatile boolean SUBMIT_COMPLETE = false;
+    // Set once the ack watermark has caught up with every submitted row. THIS is what
+    // silences the per-second progress + probe lines, so only the final summary follows.
+    // Gating on SUBMIT_COMPLETE instead was wrong: with store-and-forward, an outage can
+    // leave tens of millions of rows buffered after the last submit, and that drain is
+    // exactly what a durability demo needs to show. A real run went quiet at
+    // acknowledged=63.9M of 100M, hiding both the remaining acks and the fact that reads
+    // were still being served off a replica throughout.
+    private static volatile boolean ALL_ACKED = false;
 
     public static void main(String[] args) throws Exception {
         // Parse CLI flags
@@ -248,10 +256,13 @@ public class CsvParallelSender {
                 }
                 if (ack >= totalEvents) {
                     commitDoneNanos.compareAndSet(0, System.nanoTime());
+                    ALL_ACKED = true;
                 }
-                // Once everything is submitted, go quiet - no per-second spam while the client
-                // drains. The final "All workers completed ..." summary is the single last line.
-                if (SUBMIT_COMPLETE) {
+                // Go quiet only once the ACKS have caught up, not merely once submission has.
+                // The drain after the last submit is where store-and-forward earns its keep, so
+                // keep reporting it. The final "All workers completed ..." summary is still the
+                // single last line.
+                if (ALL_ACKED) {
                     continue;
                 }
                 System.out.printf("[progress] submitted=%,d (+%,d/s) | acknowledged=%,d (+%,d/s)%n",
@@ -916,7 +927,7 @@ public class CsvParallelSender {
                                 served = " served by role=" + handshake + " node=" + node + " zone=" + zone
                                         + " (handshake role; live 'switch status' unavailable, may be stale)";
                             }
-                            if (!SUBMIT_COMPLETE) {
+                            if (!ALL_ACKED) {
                                 System.out.printf("[probe] latest trades timestamp = %s (raw=%d)%s%n",
                                         ts, latest[0], served);
                             }
@@ -928,7 +939,7 @@ public class CsvParallelSender {
                                     System.out.println("[probe] live role unavailable: " + statusDiag[0]);
                                 }
                             }
-                        } else if (!SUBMIT_COMPLETE) {
+                        } else if (!ALL_ACKED) {
                             // Connected and the query succeeded, but no row came back. Say so
                             // rather than printing nothing, which would look identical to the
                             // read being down.
@@ -944,7 +955,7 @@ public class CsvParallelSender {
                         // Print EVERY failed attempt, not just the first. Reads are supposed to
                         // survive a primary outage by moving to a replica, so each tick the read
                         // is still down is the thing the demo needs to show, with the reason.
-                        if (!SUBMIT_COMPLETE) {
+                        if (!ALL_ACKED) {
                             System.out.printf("[probe] read DOWN, attempt %d failed after %dms: %s%n",
                                     downTicks[0], (System.nanoTime() - tickStart) / 1_000_000L,
                                     String.valueOf(e.getMessage()));
