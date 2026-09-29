@@ -34,7 +34,11 @@ import java.util.zip.GZIPInputStream;
 public class CsvParallelSender {
 
     // Defaults mirror your Python script
-    private static final String DEFAULT_ADDRS = "questdb:9000";
+    // The HA cluster's three nodes, so a bare run without --addrs already exercises failover.
+    // These are VPC-internal addresses: reachable from the sender host inside the VPC, not from
+    // outside it.
+    private static final String DEFAULT_ADDRS =
+            "172.31.42.41:9000,172.31.41.35:9000,10.0.0.8:9000";
     private static final long DEFAULT_TOTAL_EVENTS = 1_000_000L;
     private static final int DEFAULT_DELAY_MS = 50;
     // Target aggregate generation rate in rows/second across ALL workers. 0 disables rate
