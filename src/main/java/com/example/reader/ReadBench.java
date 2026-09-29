@@ -53,7 +53,9 @@ public class ReadBench {
 
     static final class Args {
         String table;
-        String addr = "localhost:9000";
+        // All three cluster nodes, matching CsvParallelSender.DEFAULT_ADDRS: a bare run
+        // then exercises failover. VPC-internal addresses, not reachable from outside.
+        String addr = "172.31.42.41:9000,172.31.41.35:9000,10.0.0.8:9000";
         long limit = 10_000_000L;
         int readers = 1;
         String split = "rows";

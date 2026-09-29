@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Read the last N rows of a table with the Java QWP reader (com.example.reader.ReadBench).
 #
-# With no arguments it runs the demo read against $QDB_ADDR (default 172.31.42.41:9000),
+# With no arguments it runs the demo read against $QDB_ADDR (default: all three cluster
+# nodes, so failover is exercised),
 # authenticating with $ILP_TOKEN. With arguments, they are passed straight to ReadBench:
 #
 #   ./query_table.sh trades --addr h1:9000,h2:9000 --limit 200000000 \
@@ -20,7 +21,7 @@ fi
 if [ "$#" -eq 0 ]; then
     : "${ILP_TOKEN:?set ILP_TOKEN to your QuestDB token}"
     set -- trades \
-        --addr "${QDB_ADDR:-172.31.42.41:9000}" \
+        --addr "${QDB_ADDR:-172.31.42.41:9000,172.31.41.35:9000,10.0.0.8:9000}" \
         --limit 200000000 \
         --token "$ILP_TOKEN" \
         --tls-verify unsafe_off \
