@@ -24,6 +24,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import com.opencsv.CSVReader;
 
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.BufferedReader;
@@ -227,6 +228,18 @@ public class CsvParallelSender {
             ACKED_ROWS[i] = new AtomicLong();
         }
 
+        // A non-empty store-and-forward root at startup means a previous run died holding
+        // unacked frames. The client replays them before (and alongside) new sends, and that
+        // replay is otherwise invisible: it shows up only as seconds of submitted=0 with the
+        // acked counter pinned at zero, because the backlog belongs to the previous process's
+        // slot and never passes through ACKED_ROWS.
+        final long sfStartBytes = sfDirBytes(storeForwardDir);
+        if (sfStartBytes > 0) {
+            System.out.printf("[store-and-forward] found %s of pending frames in %s; "
+                            + "REPLAYING previous run's unacked data before new sends%n",
+                    humanBytes(sfStartBytes), storeForwardDir);
+        }
+
         // Records (to ~1s resolution) when all rows were submitted and when all were acknowledged,
         // so the summary can separate the submit phase from the commit-drain tail.
         final AtomicLong appendDoneNanos = new AtomicLong(0);
@@ -236,6 +249,7 @@ public class CsvParallelSender {
         // run ahead of the server) and acknowledged (rows the server has actually committed). The
         // gap between them is the buffered backlog; during the drain, submitted is flat while
         // acknowledged keeps climbing (real work), so there is no misleading "0 rows/s".
+        final long[] lastSfBytes = {sfStartBytes};
         final Thread reporter = new Thread(() -> {
             long lastSub = 0;
             long lastAck = 0;
@@ -269,6 +283,18 @@ public class CsvParallelSender {
                         sub, sub - lastSub, ack, ack - lastAck);
                 lastSub = sub;
                 lastAck = ack;
+                // Watch the spill shrink. Only reported while there is something there, so a
+                // healthy run with no backlog stays quiet.
+                final long sfNow = sfDirBytes(storeForwardDir);
+                if (sfNow > 0) {
+                    System.out.printf("[store-and-forward] backlog on disk: %s%s%n",
+                            humanBytes(sfNow),
+                            lastSfBytes[0] > 0 && sfNow != lastSfBytes[0]
+                                    ? String.format(" (%+.1f MiB/s)",
+                                        (sfNow - lastSfBytes[0]) / (1024.0 * 1024.0))
+                                    : "");
+                }
+                lastSfBytes[0] = sfNow;
             }
         });
         reporter.setDaemon(true);
@@ -436,15 +462,82 @@ public class CsvParallelSender {
                 while (!sender.awaitAckedFsn(finalSeq, 200L) && System.nanoTime() < drainDeadline) {
                     ACKED_ROWS[senderId].set(ackedRows(sender, fsnToRows));
                 }
+                // Re-read once on exit. awaitAckedFsn returning true breaks the loop BEFORE the
+                // body runs again, so without this the counter keeps whatever the last iteration
+                // left and under-reports for the rest of the run (observed: stuck at 15,300,000
+                // of 30,000,000 while the server had in fact acked everything).
+                ACKED_ROWS[senderId].set(ackedRows(sender, fsnToRows));
             } else {
                 sender.flush();
             }
-            ACKED_ROWS[senderId].set(sent);
-            System.out.printf("Sender %d finished sending %d events%n", senderId, sent);
+            // Deliberately NOT setting ACKED_ROWS to `sent` here, and deliberately not printing
+            // "finished" yet. The try-with-resources close() below is where the bulk of the
+            // durability wait actually happens: measured locally, awaitAckedFsn above returned
+            // almost immediately while close() took 12.8s of a 19.8s run. Claiming every row was
+            // acked before that wait made the reporter believe the run was done, which silenced
+            // both the progress line and the read probe for the whole drain -- the exact window a
+            // durability demo needs to show.
         } catch (Exception e) {
             System.err.printf("Sender %d got error: %s%s%n", senderId, e.toString(), upgradeHint(e));
             throw new RuntimeException(e);
         }
+        // Reached only after close() returned, i.e. after the real drain. Now the full count is
+        // true rather than aspirational.
+        ACKED_ROWS[senderId].set(sent);
+        System.out.printf("Sender %d finished sending %d events%n", senderId, sent);
+    }
+
+    // Bytes currently spilled under the store-and-forward root. The client exposes no replay
+    // event and no backlog metric, so the filesystem is the only observable signal that a
+    // restart is replaying a previous run's unacked frames. Cheap enough to sample once a
+    // second: a few hundred segment files.
+    private static long sfDirBytes(String dir) {
+        final Path root = Path.of(dir);
+        if (!Files.exists(root)) {
+            return 0L;
+        }
+        try (java.util.stream.Stream<Path> walk = Files.walk(root)) {
+            return walk.filter(Files::isRegularFile).mapToLong(f -> {
+                try {
+                    return Files.size(f);
+                } catch (IOException ignored) {
+                    return 0L;   // segment reclaimed mid-walk; it simply no longer counts
+                }
+            }).sum();
+        } catch (IOException e) {
+            return 0L;
+        }
+    }
+
+    private static String humanBytes(long bytes) {
+        if (bytes < 1024L) {
+            return bytes + " B";
+        }
+        if (bytes < 1024L * 1024L) {
+            return String.format("%.1f KiB", bytes / 1024.0);
+        }
+        if (bytes < 1024L * 1024L * 1024L) {
+            return String.format("%.1f MiB", bytes / (1024.0 * 1024.0));
+        }
+        return String.format("%.2f GiB", bytes / (1024.0 * 1024.0 * 1024.0));
+    }
+
+    // Unacked rows still owed to the server, i.e. what store-and-forward has to replay. The client
+    // exposes no replay event: SenderConnectionEvent.Kind carries only CONNECTED, DISCONNECTED,
+    // RECONNECTED, FAILED_OVER, ENDPOINT_ATTEMPT_FAILED, ALL_ENDPOINTS_UNREACHABLE and AUTH_FAILED,
+    // and bufferView() is just the unflushed local buffer, not the spilled backlog. So derive the
+    // figure from our own counters and announce it on reconnect; the acknowledged counter then
+    // climbing in the progress lines IS the replay.
+    private static String backlogNote() {
+        long acked = 0;
+        for (AtomicLong al : ACKED_ROWS) {
+            acked += al.get();
+        }
+        final long backlog = TOTAL_SENT.get() - acked;
+        if (backlog <= 0) {
+            return "";
+        }
+        return String.format(" -- REPLAYING store-and-forward backlog of %,d row(s)", backlog);
     }
 
     // Rows the server has acknowledged for this sender: map the ack watermark (getAckedFsn) back to
@@ -630,10 +723,11 @@ public class CsvParallelSender {
                     msg = "connected to " + host;
                     break;
                 case RECONNECTED:
-                    msg = "reconnected to " + host;
+                    msg = "reconnected to " + host + backlogNote();
                     break;
                 case FAILED_OVER:
-                    msg = "failed over " + event.getPreviousHost() + ":" + event.getPreviousPort() + " -> " + host;
+                    msg = "failed over " + event.getPreviousHost() + ":" + event.getPreviousPort()
+                            + " -> " + host + backlogNote();
                     break;
                 case AUTH_FAILED:
                     msg = "auth failed for " + host;
@@ -927,10 +1021,10 @@ public class CsvParallelSender {
                                 served = " served by role=" + handshake + " node=" + node + " zone=" + zone
                                         + " (handshake role; live 'switch status' unavailable, may be stale)";
                             }
-                            if (!ALL_ACKED) {
-                                System.out.printf("[probe] latest trades timestamp = %s (raw=%d)%s%n",
-                                        ts, latest[0], served);
-                            }
+                            // Unconditional: a read that is still being served is exactly what a
+                            // failover demo has to keep showing, including after submission ends.
+                            System.out.printf("[probe] latest trades timestamp = %s (raw=%d)%s%n",
+                                    ts, latest[0], served);
                             // Explain a missing live role at most once per 30s so it does not spam.
                             if (currentRole[0] == null && statusDiag[0] != null) {
                                 final long now = System.currentTimeMillis();
@@ -939,7 +1033,7 @@ public class CsvParallelSender {
                                     System.out.println("[probe] live role unavailable: " + statusDiag[0]);
                                 }
                             }
-                        } else if (!ALL_ACKED) {
+                        } else {
                             // Connected and the query succeeded, but no row came back. Say so
                             // rather than printing nothing, which would look identical to the
                             // read being down.
@@ -955,7 +1049,7 @@ public class CsvParallelSender {
                         // Print EVERY failed attempt, not just the first. Reads are supposed to
                         // survive a primary outage by moving to a replica, so each tick the read
                         // is still down is the thing the demo needs to show, with the reason.
-                        if (!ALL_ACKED) {
+                        {
                             System.out.printf("[probe] read DOWN, attempt %d failed after %dms: %s%n",
                                     downTicks[0], (System.nanoTime() - tickStart) / 1_000_000L,
                                     String.valueOf(e.getMessage()));
