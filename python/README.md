@@ -23,6 +23,18 @@ This port has grown a few scripts. Pick by what you need:
 | `read_bench.py` | Measuring read/scan throughput (rows/s) of a table | Streaming `iter_arrow()` egress. |
 | `enrich_polars_demo.py` | Read a table as polars, enrich, write it back as polars | Streaming read + columnar write. |
 | `dataframe_demo.py` | pandas/polars ingestion + egress round-trip showcase | `db.dataframe` (pandas + polars), `db.execute`, dual egress. |
+| `backfill.py` | Filling a historical window at a target row density | Columnar write over a chosen time range. |
+| `tca_live.py` | **Live TCA dashboard** - slippage, markout curves and local min/max, redrawn every second | Four rolling-window queries per tick; `to_polars()`. |
+| `blotter.py` | Terminal blotter: poll a table or live view and redraw in place | Polling query, in-place terminal redraw. |
+| `web_blotter.py` | The same blotter served as a live table in a browser | Tiny local HTTP server over the same queries. |
+| `slippage.py` | Per-fill slippage vs mid and top-of-book, as one DataFrame | `to_polars()`, materialise-whole. |
+| `slippage_stream.py` | The same, printed batch by batch as it streams | `iter_polars()`, low peak memory. |
+| `slippage_parallel.py` | The same over N connections, merged into one DataFrame | N connections, concatenated client-side. |
+| `slippage_parallel_stream.py` | N connections, printed in timestamp order as they arrive | Bounded per-worker queues, ordered drain. |
+
+The four `slippage*.py` scripts are the same query with different egress shapes, and exist to
+contrast them: buffer-everything vs streaming, one connection vs several. `tca_live.py` is the
+one to reach for if you want a dashboard rather than a one-shot result.
 
 **Row-by-row vs columnar.** `sender.row()` in a Python loop is the *slowest* path: every cell
 crosses the Python/Cython boundary under the GIL (the client's own perf notes call it "~16x
@@ -173,6 +185,42 @@ Enterprise-only (needs SYSTEM ADMIN); on OSS the probe prints
 `(live 'switch status' unavailable, ...)`. The handle uses `target=any` (replica-fallback
 reads) and fails over across the `--addrs` hosts. (5.0 also exposes `db.server_info()` for the
 handshake role/epoch/capabilities, should a probe want the role without `switch status`.)
+
+## Live TCA dashboard (`tca_live.py`)
+
+Four panels over QWP, redrawn once a second, each a rolling window so cost and memory stay
+flat however long it runs.
+
+```bash
+python tca_live.py --conf "ws::addr=localhost:9000;"
+ILP_TOKEN=... python tca_live.py --addr 172.31.42.41:9000 --symbol EURUSD
+```
+
+The layout is organised around the **delay** each measurement needs. Anything looking forward
+in time cannot be evaluated until that window has elapsed, so each query shifts its window
+back by exactly its own forward horizon:
+
+| Panel | Window | Forward horizon | Delay |
+| --- | --- | --- | --- |
+| slippage | `$now-1m .. $now` | none | live |
+| markout `-1m..+1m` | `$now-2m .. $now-1m` | +1m | 1m |
+| markout `-1m..0` | `$now-1m .. $now` | none | live |
+| min/max +-10s | `$now-70s .. $now-10s` | +10s | 10s |
+
+The two markout panels side by side are the point: the delayed one shows the complete curve
+either side of the fill, the live one only what has already happened.
+
+Each markout panel issues **two** statements and `--view` picks which run, so a pivot-only run
+never pays for the raw one. The raw statement is the query as authored; the pivot is the same
+calculation grouped by `ecn` and horizon alone, so the curve on screen is a pure reshape of a
+server-side aggregate rather than something recomputed in Python.
+
+Useful flags: `--symbol` (applied in SQL), `--interval-ms` (default 1000), `--view
+pivot|raw|both`, `--panels`, `--precision`, `--raw-rows`, `--layout side|stacked`.
+
+**Terminal width matters.** With `--view both` the raw and pivoted tables sit side by side, so
+the `+-1m` panel renders at ~400 columns. On a narrower terminal use `--view pivot` or
+`--panels markout-past`.
 
 ## Dataframe demo (pandas / polars ingestion + egress)
 

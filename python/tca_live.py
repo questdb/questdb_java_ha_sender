@@ -26,6 +26,7 @@ Needs the questdb 5.0 client plus polars and pyarrow.
 import argparse
 import os
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -177,6 +178,10 @@ def build_sql(symbol):
 
 PANELS = ("slippage", "markout-full", "markout-past", "minmax")
 
+# Smallest pause at the end of every tick, even one that overran its interval, so the
+# interpreter always gets a slice in which to deliver SIGINT.
+MIN_YIELD_MS = 50
+
 
 # ---------------------------------------------------------------- rendering
 def build_conf(args):
@@ -190,6 +195,12 @@ def build_conf(args):
         parts.append("username=" + args.username + ";password=" + args.password + ";")
     if tls and args.tls_verify == "unsafe_off":
         parts.append("tls_verify=unsafe_off;")
+    # Read-only tool, so never open an ingest connection: connect() otherwise pre-opens a
+    # store-and-forward sender, which this never uses. The reader pool is still opened
+    # eagerly, so an unreachable server at startup fails fast rather than launching a
+    # dashboard that cannot show anything. Recovery once running is handled by rebuilding
+    # the lease.
+    parts.append("sender_pool_min=0;")
     return "".join(parts)
 
 
@@ -409,7 +420,8 @@ def render(frames, timings, args, tick):
 
 
 # ---------------------------------------------------------------- main
-def main(argv):
+def parse_args(argv):
+    """CLI definition, split out so main() only supervises the worker thread."""
     ap = argparse.ArgumentParser(description="Live TCA dashboard over QWP")
     ap.add_argument("--addr", default="localhost:9000", help="host:port")
     ap.add_argument("--conf", default=None,
@@ -459,8 +471,77 @@ def main(argv):
     ap.add_argument("--panels", default=",".join(PANELS),
                     help="comma-separated subset of: " + ", ".join(PANELS))
     args = ap.parse_args(argv)
+    args.panels = [x.strip() for x in args.panels.split(",") if x.strip()]
+    return args
 
-    args.panels = [p.strip() for p in args.panels.split(",") if p.strip()]
+
+def run_dashboard(args, sql):
+    """The polling loop. Runs on a DAEMON thread so the main thread can stay responsive."""
+    conf = build_conf(args)
+    tick = 0
+    with questdb.connect(conf) as db:
+        # The lease is REBUILT after any failure rather than held for the whole run.
+        #
+        # Reader failover is on by default (8 attempts, 30s budget) and to_polars() replays a
+        # mid-query failover transparently, so a node dying mid-result is invisible here. What
+        # is not automatic is the lease itself: a terminal rejection is latched by the
+        # connection and "raised by the next call on the affected lease", so a lease held for
+        # the process lifetime can be poisoned permanently and every later tick then fails on a
+        # connection that will never recover. Dropping it and taking a fresh one is the only
+        # way back, the same lesson as the Java probe's query client.
+        reader = None
+        while True:
+            started = time.monotonic()
+            frames, timings = {}, {}
+            try:
+                if reader is None:
+                    reader = db.reader()
+                for name in args.panels:
+                    spec = sql[name]
+                    # Markout panels carry {"raw","pivot"}; run only what --view will draw so a
+                    # --view pivot run does not pay for the larger authored query.
+                    wanted = ([spec] if isinstance(spec, str)
+                              else [spec[v] for v in ("raw", "pivot")
+                                    if args.view in (v, "both")])
+                    t0 = time.monotonic()
+                    got = [reader.query(stmt.strip()).to_polars() for stmt in wanted]
+                    frames[name] = got[0] if isinstance(spec, str) else got
+                    timings[name] = (time.monotonic() - t0) * 1000.0
+            except KeyboardInterrupt:
+                raise          # BaseException, so not caught below; re-raised for clarity
+            except Exception as e:  # noqa: BLE001
+                # Keep drawing: a dashboard that dies on one bad tick is worse than one that
+                # says which tick failed and why, then reconnects.
+                print(f"[tick {tick + 1}] {e}; reconnecting", file=sys.stderr)
+                try:
+                    reader.close()
+                except Exception:  # noqa: BLE001
+                    pass          # a dead lease often will not close cleanly
+                reader = None
+
+            tick += 1
+            if frames:
+                render(frames, timings, args, tick)
+
+            # Hold the cadence, and say so when the queries cannot keep up rather than
+            # silently drifting.
+            #
+            # The floor is not cosmetic. Python can only raise KeyboardInterrupt between
+            # bytecodes, never inside the client's blocking native connect. When a tick
+            # overran we used to skip the sleep entirely and re-enter native code
+            # immediately, so during an outage (every tick overruns, each burning a connect
+            # timeout) there was no window for the signal to land and Ctrl+C did nothing.
+            # Always yielding a slice guarantees one.
+            spent_ms = (time.monotonic() - started) * 1000.0
+            if spent_ms >= args.interval_ms:
+                print(f"[warn] tick took {spent_ms:.0f}ms, longer than the "
+                      f"{args.interval_ms}ms refresh", file=sys.stderr)
+            time.sleep(max(MIN_YIELD_MS, args.interval_ms - spent_ms) / 1000.0)
+    return 0
+
+
+def main(argv):
+    args = parse_args(argv)
     bad = [p for p in args.panels if p not in PANELS]
     if bad:
         print("unknown panel(s): " + ", ".join(bad), file=sys.stderr)
@@ -468,50 +549,24 @@ def main(argv):
 
     sql = build_sql(args.symbol)
 
-    conf = build_conf(args)
-    tick = 0
-    with questdb.connect(conf) as db:
-        # One pinned connection for the whole session: these are several queries in a
-        # row, which is exactly what a reader lease is for.
-        with db.reader() as reader:
-            while True:
-                started = time.monotonic()
-                frames, timings = {}, {}
-                for name in args.panels:
-                    spec = sql[name]
-                    # Markout panels carry {"raw","pivot"}; run only what --view will draw so a
-                    # --view pivot run does not pay for the 20,000-row authored query.
-                    wanted = ([spec] if isinstance(spec, str)
-                              else [spec[v] for v in ("raw", "pivot")
-                                    if args.view in (v, "both")])
-                    t0 = time.monotonic()
-                    got = []
-                    for stmt in wanted:
-                        try:
-                            got.append(reader.query(stmt.strip()).to_polars())
-                        except Exception as e:  # noqa: BLE001
-                            # Keep drawing. A dashboard that dies on one bad tick is worse
-                            # than one that shows which panel is failing and why.
-                            got.append(None)
-                            print(f"[{name}] {e}", file=sys.stderr)
-                    frames[name] = got[0] if isinstance(spec, str) else got
-                    timings[name] = (time.monotonic() - t0) * 1000.0
-                tick += 1
-                render(frames, timings, args, tick)
-
-                # Hold the cadence, and say so when the queries cannot keep up rather
-                # than silently drifting.
-                spent_ms = (time.monotonic() - started) * 1000.0
-                if spent_ms < args.interval_ms:
-                    time.sleep((args.interval_ms - spent_ms) / 1000.0)
-                else:
-                    print(f"[warn] tick took {spent_ms:.0f}ms, longer than the "
-                          f"{args.interval_ms}ms refresh", file=sys.stderr)
+    # The query work runs on a daemon thread and the main thread only ever waits on join(),
+    # which is interruptible. Python can only deliver KeyboardInterrupt between bytecodes,
+    # never inside the client's blocking native calls, so a loop that does its own querying
+    # on the main thread is unkillable for as long as that call blocks. During an outage
+    # every tick blocks on a connect, which is exactly when you most want to stop it.
+    worker = threading.Thread(target=run_dashboard, args=(args, sql), daemon=True)
+    worker.start()
+    try:
+        while worker.is_alive():
+            worker.join(0.2)
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        # _exit, not sys.exit: a normal exit would try to close the handle and could block
+        # in the same native code we are trying to escape. The daemon thread dies with us.
+        sys.stderr.flush()
+        os._exit(130)
     return 0
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main(sys.argv[1:]))
-    except KeyboardInterrupt:
-        sys.exit(130)
+    sys.exit(main(sys.argv[1:]))
