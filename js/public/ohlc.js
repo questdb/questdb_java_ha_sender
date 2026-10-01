@@ -24,6 +24,7 @@ const statsEl = document.getElementById("rt-stats");
 const titleEl = document.getElementById("rt-title");
 const noteEl = document.getElementById("rt-note");
 const chartEl = document.getElementById("rt-chart");
+const quoteEl = document.getElementById("rt-quote");
 
 const INK = "#d7dce3", DIM = "#78828f", LINE = "#242a33", PANEL = "#161a21";
 const UP = "#4ec9a5", DOWN = "#e2705f", VWAP = "#c98500", VOL = "#2f3a4a";
@@ -40,6 +41,13 @@ let vwapPv = 0, vwapQty = 0;
 // Zooming or panning away deliberately stops the chart following; sitting at the right edge
 // keeps it following, at whatever zoom the user chose.
 let barCount = 0, following = true;
+// Poll instrumentation. "It feels slow" has several possible causes - the browser throttling
+// the timer, a slow round trip, or simply one new candle per second because that is the bar
+// width - and they are indistinguishable by eye. These are measured and shown.
+let pollTimes = [], pollMs = 0, barsSeen = 0, barsAt = Date.now();
+// The moving bid/ask lines, and when the bars were last refetched. Quotes are polled every
+// tick; bars only need refetching about once a bar, since that is all they can change.
+let bidLine = null, askLine = null, lastBars = 0;
 
 /** Built once. Rebuilding per reload would throw the viewport away on every parameter change. */
 function ensureChart() {
@@ -82,6 +90,13 @@ function ensureChart() {
     priceScaleId: "vol", color: VOL, priceFormat: { type: "volume" },
   });
   chart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+
+  // Two lines that move with every quote. A 1s candle closes once a second however fast the
+  // page polls, so without these the chart looks like a slideshow between boundaries.
+  bidLine = candles.createPriceLine({ price: 0, color: UP, lineWidth: 1, lineStyle: 2,
+                                      axisLabelVisible: true, title: "bid" });
+  askLine = candles.createPriceLine({ price: 0, color: DOWN, lineWidth: 1, lineStyle: 2,
+                                      axisLabelVisible: true, title: "ask" });
 
   chart.subscribeCrosshairMove(onCrosshair);
 
@@ -230,13 +245,45 @@ async function load({ keepView = false } = {}) {
  * replaces the last bar WITHOUT touching the viewport. Re-running setData every second would
  * fight whatever the user is currently zoomed into.
  */
+/** The fast half: one row, so it can be polled as often as the user likes. */
+async function quoteTick() {
+  if (!chart) return;
+  const startedAt = performance.now();
+  try {
+    const qs = new URLSearchParams({ symbol: symEl.value || "" });
+    const q = await (await fetch(`/api/quote?${qs}`)).json();
+    if (q.error || !Number.isFinite(q.bid)) return;
+    pollMs = performance.now() - startedAt;
+    const now = Date.now();
+    pollTimes.push(now);
+    while (pollTimes.length && now - pollTimes[0] > 3000) pollTimes.shift();
+
+    bidLine.applyOptions({ price: q.bid });
+    askLine.applyOptions({ price: q.ask });
+    const mid = ((q.bid + q.ask) / 2).toFixed(decimals);
+    const spread = ((q.ask - q.bid) * 1e4).toFixed(2);
+    quoteEl.innerHTML = `bid <b>${q.bid.toFixed(decimals)}</b>&nbsp; `
+      + `ask <b>${q.ask.toFixed(decimals)}</b>&nbsp; mid <b>${mid}</b>&nbsp; `
+      + `spread <b>${spread}</b> bps`;
+    showAge();
+  } catch { /* a dropped quote is not worth interrupting the chart for */ }
+}
+
 async function tailTick() {
   if (loading || !chart) return;
+  // Bars can only change once per bar width, so refetching them at the quote rate is waste.
+  if (Date.now() - lastBars < 900) return;
+  lastBars = Date.now();
+  const startedAt = performance.now();
   try {
     const qs = new URLSearchParams({
       symbol: symEl.value || "", interval: intervalEl.value, seconds: "60",
     });
     const body = await (await fetch(`/api/ohlc-tail?${qs}`)).json();
+    pollMs = performance.now() - startedAt;
+    const now = Date.now();
+    pollTimes.push(now);
+    while (pollTimes.length && now - pollTimes[0] > 3000) pollTimes.shift();
     if (body.error || !body.rows?.length) return;
     const { bars, vols } = toSeries(body.columns, body.rows);
     const first = bars.findIndex((b) => b.time >= lastBarTime);
@@ -255,7 +302,7 @@ async function tailTick() {
         vwapQty += barVol;
       }
       if (vwapQty > 0) vwapLine.update({ time: bars[i].time, value: vwapPv / vwapQty });
-      if (bars[i].time > lastBarTime) barCount += 1;
+      if (bars[i].time > lastBarTime) { barCount += 1; barsSeen += 1; barsAt = Date.now(); }
       lastBarTime = bars[i].time;
     }
     // Pans to the newest bar WITHOUT changing the zoom, so a zoomed-in view keeps ticking.
@@ -292,7 +339,16 @@ function showAge() {
     : seconds < 5400 ? `${Math.round(seconds / 60)}m`
     : `${(seconds / 3600).toFixed(1)}h`;
   const state = seconds <= 15 ? "live" : "writer idle or paused";
-  tile.innerHTML = `<b>${text}</b><span>behind newest row &middot; ${state}</span>`;
+  // Polls per second over a 3s window, the measured round trip, and how long since a NEW
+  // candle appeared. If polls/s is high but new bars are 1/s, the bar width is the limit,
+  // not the polling.
+  const rate = pollTimes.length > 1
+    ? (1000 * (pollTimes.length - 1) / Math.max(1, pollTimes.at(-1) - pollTimes[0])).toFixed(1)
+    : "0";
+  const sinceBar = ((Date.now() - barsAt) / 1000).toFixed(1);
+  tile.innerHTML = `<b>${text}</b><span>behind newest row &middot; ${state}<br>`
+    + `${rate}/s polls &middot; ${pollMs.toFixed(0)}ms rtt &middot; new bar ${sinceBar}s ago`
+    + `</span>`;
 }
 
 // Ticks regardless of whether data arrives, so a stalled writer shows as a rising number
@@ -305,7 +361,10 @@ function setLive(on) {
   // still grows as trades land, so a 250ms poll on 1s bars redraws it four times before it
   // closes. At 1000ms the candle only ever appeared finished, which is what made the chart
   // look like it was barely ticking.
-  if (on) timer = setInterval(tailTick, Number(tickEl.value) || 250);
+  if (on) {
+    const every = Number(tickEl.value) || 250;
+    timer = setInterval(() => { quoteTick(); tailTick(); }, every);
+  }
 }
 
 goEl.addEventListener("click", () => load({ keepView: false }));

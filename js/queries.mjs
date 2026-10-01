@@ -260,3 +260,21 @@ WHERE symbol = '${symbol}'
 SAMPLE BY ${interval}
 ORDER BY timestamp`;
 };
+
+/**
+ * The newest quote for one instrument: one row, read straight off the tick table.
+ *
+ * This is what makes the chart feel alive. A 1s candle can only ever close once a second, so
+ * candles alone look like a slideshow however fast the page polls. The quote changes with
+ * every tick the venue sends, so polling THIS at 100ms gives continuous motion between
+ * candle boundaries. LATEST ON walks the symbol index backwards, so it stays a single-row
+ * lookup no matter how large the table is.
+ */
+export const latestQuoteSql = (symbol) => {
+  if (!symbol) throw new Error("a symbol is required");
+  return `
+SELECT timestamp, bid_price AS bid, ask_price AS ask
+FROM core_price
+WHERE symbol = '${symbol}'
+LATEST ON timestamp PARTITION BY symbol`;
+};

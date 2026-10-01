@@ -147,6 +147,18 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  if (url.pathname === "/api/quote") {
+    try {
+      const payload = await data.quote(url.searchParams.get("symbol") || symbol || "");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(payload, bigints));
+    } catch (error) {
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: String(error?.message ?? error) }));
+    }
+    return;
+  }
+
   if (url.pathname === "/api/ohlc-options") {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({

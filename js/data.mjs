@@ -7,7 +7,7 @@
 import { connectQwpNodeClient, QwpEgressQueryError } from "@questdb/nodejs-client";
 import {
   OHLC_INTERVALS, OHLC_LOOKBACKS, PANELS, ohlcLastRowSql, ohlcSql, ohlcSymbolsSql,
-  ohlcTailSql, scanChunks, sqlFor, symbolsSql,
+  latestQuoteSql, ohlcTailSql, scanChunks, sqlFor, symbolsSql,
 } from "./queries.mjs";
 
 /**
@@ -257,6 +257,27 @@ export class Data {
       const bars = await this.#run(lease, ohlcTailSql({ symbol, interval, seconds }));
       return { symbol, interval, columns: bars.columns, rows: bars.rows,
                ms: performance.now() - started };
+    } finally {
+      await lease.close();
+    }
+  }
+
+  /** One row: the newest bid/ask. Polled far faster than the bars. */
+  async quote(symbol) {
+    const started = performance.now();
+    const lease = await this.db.borrowQuery();
+    try {
+      const { columns, rows } = await this.#run(lease, latestQuoteSql(symbol));
+      const row = rows[0];
+      if (!row) return { symbol, ms: performance.now() - started };
+      const ix = Object.fromEntries(columns.map((c, i) => [c, i]));
+      return {
+        symbol,
+        timestamp: row[ix.timestamp],
+        bid: Number(row[ix.bid]),
+        ask: Number(row[ix.ask]),
+        ms: performance.now() - started,
+      };
     } finally {
       await lease.close();
     }
