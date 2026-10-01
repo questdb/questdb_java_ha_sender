@@ -219,20 +219,36 @@ const server = createServer(async (req, res) => {
       "x-accel-buffering": "no",
     });
 
+    // Bars ride the same stream as quotes, for the same reason plus one more: a browser
+    // throttles setInterval to 1Hz in a background tab, but does not throttle an incoming
+    // stream. Polling the bars on a timer pinned them to one update a second whenever the
+    // tab was not focused, however fresh the data was.
+    const interval = url.searchParams.get("interval") ?? "1s";
+
     let stop = false;
     res.on("close", () => { stop = true; });
 
     // Only CHANGES are sent. A venue that has not moved should not cost a frame.
-    let lastSent = "";
+    let lastQuote = "", lastBar = "";
     (async () => {
       while (!stop) {
         const startedAt = Date.now();
         try {
           const q = await data.quote(sym);
           const key = `${q.bid}|${q.ask}|${q.timestamp}`;
-          if (key !== lastSent && Number.isFinite(q.bid)) {
-            lastSent = key;
+          if (key !== lastQuote && Number.isFinite(q.bid)) {
+            lastQuote = key;
             res.write(`event: quote\ndata: ${JSON.stringify(q, bigints)}\n\n`);
+          }
+
+          const bars = await data.ohlcTail({ symbol: sym, interval, seconds: 60 });
+          const newest = bars.rows?.at(-1);
+          // The replacer is not optional: result rows carry BigInt, which JSON.stringify
+          // refuses outright, and the throw was being swallowed as a "failed" event.
+          const barKey = newest ? JSON.stringify(newest, bigints) : "";
+          if (barKey && barKey !== lastBar) {
+            lastBar = barKey;
+            res.write(`event: bars\ndata: ${JSON.stringify(bars, bigints)}\n\n`);
           }
         } catch (error) {
           if (!stop) res.write(`event: failed\ndata: ${JSON.stringify({

@@ -47,7 +47,7 @@ let barCount = 0, following = true;
 let pollTimes = [], pollMs = 0, barsSeen = 0, barsAt = Date.now();
 // The moving bid/ask lines, and when the bars were last refetched. Quotes are polled every
 // tick; bars only need refetching about once a bar, since that is all they can change.
-let bidLine = null, askLine = null, lastBars = 0;
+let bidLine = null, askLine = null, tailInFlight = false;
 
 /** Built once. Rebuilding per reload would throw the viewport away on every parameter change. */
 function ensureChart() {
@@ -258,10 +258,12 @@ function openQuoteStream() {
   closeQuoteStream();
   if (!chart) return;
   const qs = new URLSearchParams({
-    symbol: symEl.value || "", every: String(Number(tickEl.value) || 250),
+    symbol: symEl.value || "", interval: intervalEl.value,
+    every: String(Number(tickEl.value) || 250),
   });
   quoteSource = new EventSource(`/api/quote-stream?${qs}`);
   quoteSource.addEventListener("quote", (ev) => applyQuote(JSON.parse(ev.data)));
+  quoteSource.addEventListener("bars", (ev) => applyBars(JSON.parse(ev.data)));
 }
 
 function closeQuoteStream() {
@@ -288,22 +290,23 @@ function applyQuote(q) {
   }
 }
 
-async function tailTick() {
+/**
+ * Newest bars, PUSHED.
+ *
+ * Only CLOSED bars are immutable: the one currently forming changes with every trade that
+ * lands inside it, so it has to be redrawn continuously, not once a bar. It used to be
+ * fetched on a timer, which a browser throttles to 1Hz in a background tab - so the newest
+ * candle crawled however fresh the data was. The server polls instead and pushes changes.
+ */
+function applyBars(body) {
   if (loading || !chart) return;
-  // Bars can only change once per bar width, so refetching them at the quote rate is waste.
-  if (Date.now() - lastBars < 900) return;
-  lastBars = Date.now();
-  const startedAt = performance.now();
-  try {
-    const qs = new URLSearchParams({
-      symbol: symEl.value || "", interval: intervalEl.value, seconds: "60",
-    });
-    const body = await (await fetch(`/api/ohlc-tail?${qs}`)).json();
-    pollMs = performance.now() - startedAt;
-    const now = Date.now();
-    pollTimes.push(now);
-    while (pollTimes.length && now - pollTimes[0] > 3000) pollTimes.shift();
-    if (body.error || !body.rows?.length) return;
+  if (body.error || !body.rows?.length) return;
+
+  const now = Date.now();
+  pollTimes.push(now);
+  while (pollTimes.length && now - pollTimes[0] > 3000) pollTimes.shift();
+
+  {
     const { bars, vols } = toSeries(body.columns, body.rows);
     const first = bars.findIndex((b) => b.time >= lastBarTime);
     if (first < 0) return;
@@ -327,7 +330,7 @@ async function tailTick() {
     // Pans to the newest bar WITHOUT changing the zoom, so a zoomed-in view keeps ticking.
     if (following) chart.timeScale().scrollToRealTime();
     showAge();
-  } catch { /* a dropped tick is not worth interrupting the chart for */ }
+  }
 }
 
 /**
@@ -380,12 +383,7 @@ function setLive(on) {
   // still grows as trades land, so a 250ms poll on 1s bars redraws it four times before it
   // closes. At 1000ms the candle only ever appeared finished, which is what made the chart
   // look like it was barely ticking.
-  if (on) {
-    timer = setInterval(tailTick, 1000);   // bars change once a bar, nothing is gained by more
-    openQuoteStream();
-  } else {
-    closeQuoteStream();
-  }
+  if (on) openQuoteStream(); else closeQuoteStream();
 }
 
 goEl.addEventListener("click", () => load({ keepView: false }));
