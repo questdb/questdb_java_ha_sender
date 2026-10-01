@@ -87,3 +87,40 @@ export const symbolsSql = () => `
 SELECT symbol FROM fx_trades
 WHERE timestamp IN '$now-30s..$now'
 LATEST ON timestamp PARTITION BY symbol`;
+
+// === Streaming scan ===================================================================
+//
+// LIMIT -N is the point of the demo: it asks for the LAST N rows, which QuestDB answers by
+// skipping whole page frames on partition metadata rather than reading them. The scan then
+// streams back in batches, so the client's memory is flat regardless of N.
+export const SCAN_TABLES = ["core_price", "market_data", "fx_trades"];
+
+/**
+ * Split the last `rows` rows into `chunks` equal row-count slices, oldest first.
+ *
+ * `LIMIT -m, -n` takes the last m rows then drops the last n of them, i.e. the half-open
+ * range [-m, -n), so consecutive slices tile the range with no gap and no overlap. The
+ * newest slice has n == 0, which is the documented `LIMIT -n, 0` == `LIMIT -n` form. The
+ * bounds are arithmetic on `rows` alone, so no preliminary count query is needed.
+ *
+ * Two reasons to slice rather than issue one statement. QuestDB applies its own
+ * `query.timeout` server-side (60s on the instance this was built against), which one
+ * 200M-row statement blows straight through; and slices can be read concurrently over
+ * separate connections, which is what makes a remote scan bearable. This mirrors
+ * python/read_bench.py --split rows.
+ */
+export const scanChunks = (table, rows, chunks = 1) => {
+  if (!SCAN_TABLES.includes(table)) throw new Error(`unknown table: ${table}`);
+  const limit = Math.max(1, Math.trunc(rows));
+  const n = Math.max(1, Math.trunc(chunks));
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const lo = limit - Math.floor((limit * i) / n);        // rows from the end, inclusive
+    const hi = limit - Math.floor((limit * (i + 1)) / n);  // rows from the end, exclusive
+    if (lo <= hi) continue;                                // empty slice: chunks > rows
+    out.push(hi === 0
+      ? `SELECT * FROM ${table} LIMIT -${lo}`
+      : `SELECT * FROM ${table} LIMIT -${lo}, -${hi}`);
+  }
+  return out;
+};

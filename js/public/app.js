@@ -5,6 +5,7 @@
 // fetchTick() with connectQwpBrowserEgress({url: new URL("/read/v1", location.href)}) and
 // iterate the batches here instead. Nothing else in the page changes.
 import { pnlChart, pnlLegend } from "/chart.js";
+import { EPOCH_DIGITS, epochTime } from "/format.js";
 
 const PANELS = [
   ["slippage", "slippage, last 1m", "live"],
@@ -33,10 +34,8 @@ const sqlText = new Map();
 const fmt = (v) => {
   if (v === null || v === undefined) return "null";
   if (typeof v === "number") return Number.isInteger(v) ? String(v) : v.toFixed(2);
-  // Nanosecond epochs arrive as strings (BigInt is not JSON-serialisable); show the time part.
-  if (typeof v === "string" && /^\d{16,19}$/.test(v)) {
-    return new Date(Number(v) / 1e6).toISOString().slice(11, 23);
-  }
+  // Epochs arrive as digit strings; the unit is inferred, not assumed. See format.js.
+  if (typeof v === "string" && EPOCH_DIGITS.test(v)) return epochTime(v);
   if (typeof v === "string" && /^\d{4}-\d{2}-\d{2}T/.test(v)) return v.slice(11, 23);
   return String(v);
 };
@@ -216,7 +215,60 @@ const offered = [...refreshEl.options].map((o) => Number(o.value));
 if (!offered.includes(intervalMs)) intervalMs = 1000;
 refreshEl.value = String(intervalMs);
 
-await loadSymbols();
-await tick();
-applyInterval();
-setInterval(loadSymbols, 30_000);   // instruments come and go; keep the list current
+// === Tabs =============================================================================
+//
+// Only the visible tab queries. Four TCA statements a second against a cluster is not
+// something to leave running behind a tab nobody is looking at, so switching away clears the
+// timers outright rather than hiding the output.
+let symbolsTimer = null;
+
+async function startTca() {
+  await loadSymbols();
+  await tick();
+  applyInterval();
+  symbolsTimer = setInterval(loadSymbols, 30_000);  // instruments come and go
+}
+
+function stopTca() {
+  if (timer !== null) { clearInterval(timer); timer = null; }
+  if (symbolsTimer !== null) { clearInterval(symbolsTimer); symbolsTimer = null; }
+}
+
+// Loaded on first use, so a session that never opens the scan tab never fetches its code.
+let scanModule = null;
+
+const VIEWS = {
+  tca: { view: "view-tca", ctl: "ctl-tca",
+         start: startTca,
+         stop: () => { stopTca(); metaEl.textContent = ""; } },
+  scan: { view: "view-scan", ctl: "ctl-scan",
+          start: async () => { scanModule ??= await import("/scan.js"); },
+          stop: () => scanModule?.stopScan() },
+};
+
+let current = null;
+
+async function show(name) {
+  if (current === name) return;
+  if (current) VIEWS[current].stop();
+  current = name;
+  // Every view and control row is set explicitly, not just the one being left behind: a
+  // direct ?tab=scan load has no previous tab, and the markup ships with the TCA tab mounted.
+  for (const [key, v] of Object.entries(VIEWS)) {
+    const on = key === name;
+    document.getElementById(v.view).hidden = !on;
+    document.getElementById(v.ctl).hidden = !on;
+  }
+  for (const b of tabsEl.querySelectorAll("button")) {
+    b.classList.toggle("on", b.dataset.tab === name);
+  }
+  await VIEWS[name].start();
+}
+
+const tabsEl = document.getElementById("tabs");
+tabsEl.addEventListener("click", (ev) => {
+  const btn = ev.target.closest("button[data-tab]");
+  if (btn && !btn.disabled && VIEWS[btn.dataset.tab]) show(btn.dataset.tab);
+});
+
+await show(params.get("tab") === "scan" ? "scan" : "tca");
