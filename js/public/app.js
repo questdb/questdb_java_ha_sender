@@ -234,8 +234,10 @@ function stopTca() {
   if (symbolsTimer !== null) { clearInterval(symbolsTimer); symbolsTimer = null; }
 }
 
-// Loaded on first use, so a session that never opens the scan tab never fetches its code.
+// Loaded on first use, so a session that never opens a tab never fetches its code, and the
+// chart library is not downloaded by someone who only wanted the TCA panels.
 let scanModule = null;
+let ohlcModule = null;
 
 const VIEWS = {
   tca: { view: "view-tca", ctl: "ctl-tca",
@@ -244,6 +246,14 @@ const VIEWS = {
   scan: { view: "view-scan", ctl: "ctl-scan",
           start: async () => { scanModule ??= await import("/scan.js"); },
           stop: () => scanModule?.stopScan() },
+  rt: { view: "view-rt", ctl: "ctl-rt",
+        start: async () => {
+          // The chart measures the container when it is built, so the view must already be
+          // visible: show() unhides before calling start(), which is what makes this work.
+          if (ohlcModule) ohlcModule.startOhlc();
+          else ohlcModule = await import("/ohlc.js");
+        },
+        stop: () => ohlcModule?.stopOhlc() },
 };
 
 let current = null;
@@ -271,4 +281,4 @@ tabsEl.addEventListener("click", (ev) => {
   if (btn && !btn.disabled && VIEWS[btn.dataset.tab]) show(btn.dataset.tab);
 });
 
-await show(params.get("tab") === "scan" ? "scan" : "tca");
+await show(VIEWS[params.get("tab")] ? params.get("tab") : "tca");

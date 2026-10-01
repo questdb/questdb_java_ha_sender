@@ -5,7 +5,10 @@
 // this whole file is replaced by a pass-through proxy for /read/v1 and /exec, the query moves
 // into the page, and neither server.mjs nor public/ has to change.
 import { connectQwpNodeClient, QwpEgressQueryError } from "@questdb/nodejs-client";
-import { PANELS, scanChunks, sqlFor, symbolsSql } from "./queries.mjs";
+import {
+  OHLC_INTERVALS, OHLC_LOOKBACKS, PANELS, ohlcLastRowSql, ohlcSql, ohlcSymbolsSql,
+  scanChunks, sqlFor, symbolsSql,
+} from "./queries.mjs";
 
 /**
  * Copy the last `sample` rows out of a reusable batch view.
@@ -106,7 +109,7 @@ export class Data {
    * rows are copied out before then.
    */
   async scan({ table, rows: limit, readers = 4, chunkRows = 500_000, chunks = 0,
-               sample = 10, progressMs = 100 }, onProgress, signal) {
+               projection = "all", sample = 10, progressMs = 100 }, onProgress, signal) {
     const workers = Math.max(1, Math.trunc(readers));
 
     // Slice count is derived from a bounded number of ROWS PER QUERY, not from a fixed
@@ -118,12 +121,13 @@ export class Data {
     //
     // At least one slice per reader, so nobody sits idle on a small scan.
     const sliced = Math.ceil(Math.max(1, limit) / Math.max(1, chunkRows));
-    const sqls = scanChunks(table, limit, chunks || Math.max(workers, sliced));
+    const sqls = scanChunks(table, limit, chunks || Math.max(workers, sliced), projection);
     const started = performance.now();
 
     let rows = 0, batches = 0, columns = null, tail = [], chunksDone = 0, lastSent = 0;
     const snapshot = (done) => ({
       table, sql: sqls[0] ?? "", chunks: sqls.length, chunksDone, readers: workers,
+      projection,
       columns, rows, batches, tail, done, ms: performance.now() - started,
     });
 
@@ -153,7 +157,10 @@ export class Data {
             if (columns === null) columns = batch.columns.map((c) => c.name);
             // Only now, ~10 times a second, are any rows read at all, and only `sample` of
             // them. Copied, because the view is recycled when this callback returns.
-            tail = copyTail(batch, sample);
+            // An EMPTY batch must not clear the tail: slicing a small table into many
+            // ranges yields plenty of zero-row batches, and whichever one landed on the
+            // last progress tick would leave the page showing no rows at all.
+            if (batch.rowCount > 0) tail = copyTail(batch, sample);
             onProgress(snapshot(false));
           }, {
             // The client's session default is 15s, which a slice of millions of rows runs
@@ -186,6 +193,56 @@ export class Data {
       if (!signal?.aborted) onProgress(snapshot(true));
     } finally {
       signal?.removeEventListener("abort", abort);
+    }
+  }
+
+  /**
+   * Candles for one instrument, with the window anchored to the newest row in the table.
+   *
+   * Three cheap statements on one lease: where the data ends, which symbols were trading
+   * near that point, and the bars themselves. Anchoring costs one extra query and buys a
+   * chart that still works on an instance whose writer has stopped.
+   */
+  async ohlc({ symbol, interval = "5s", lookback = "30m" }) {
+    if (!(interval in OHLC_INTERVALS)) throw new Error(`unknown interval: ${interval}`);
+    if (!(lookback in OHLC_LOOKBACKS)) throw new Error(`unknown lookback: ${lookback}`);
+
+    const started = performance.now();
+    const lease = await this.db.borrowQuery();
+    try {
+      const anchor = await this.#run(lease, ohlcLastRowSql(symbol));
+      const lastNs = anchor.rows[0]?.[0];
+      if (lastNs === null || lastNs === undefined) {
+        return { symbol, interval, lookback, columns: [], rows: [], symbols: [],
+                 ms: performance.now() - started, empty: "no rows in fx_trades" };
+      }
+
+      // Timestamps are nanoseconds here; Date works in milliseconds. Dividing through
+      // BigInt first keeps the epoch exact, since ns since 1970 is well past 2^53.
+      const lastMs = Number(BigInt(lastNs) / 1000000n);
+      const toIso = new Date(lastMs).toISOString();
+      const fromIso = new Date(lastMs - OHLC_LOOKBACKS[lookback] * 1000).toISOString();
+      // The picker lists what traded near the anchor, not what is trading now.
+      const symFromIso = new Date(lastMs - 1800 * 1000).toISOString();
+
+      const picker = await this.#run(lease, ohlcSymbolsSql(symFromIso, toIso));
+      const symbols = picker.rows.map((r) => String(r[0])).sort();
+      const chosen = symbol || symbols[0];
+      if (!chosen) {
+        return { symbol: null, interval, lookback, columns: [], rows: [], symbols,
+                 ms: performance.now() - started, empty: "no symbols in the window" };
+      }
+
+      const bars = await this.#run(lease, ohlcSql({ symbol: chosen, interval, fromIso, toIso }));
+      return {
+        symbol: chosen, interval, lookback, symbols,
+        columns: bars.columns, rows: bars.rows,
+        sql: ohlcSql({ symbol: chosen, interval, fromIso, toIso }).trim(),
+        from: fromIso, to: toIso,
+        ms: performance.now() - started,
+      };
+    } finally {
+      await lease.close();
     }
   }
 

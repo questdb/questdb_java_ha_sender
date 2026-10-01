@@ -12,7 +12,9 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join, normalize } from "node:path";
 import { Data } from "./data.mjs";
-import { PANELS, SCAN_TABLES, sqlFor } from "./queries.mjs";
+import {
+  OHLC_INTERVALS, OHLC_LOOKBACKS, PANELS, SCAN_PROJECTIONS, SCAN_TABLES, sqlFor,
+} from "./queries.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PUBLIC = join(HERE, "public");
@@ -70,7 +72,14 @@ let scanAbort = null;
 let scanSettled = Promise.resolve();
 
 const TYPES = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
-                ".css": "text/css; charset=utf-8" };
+                ".mjs": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8" };
+
+// The chart library is served from node_modules rather than a CDN: the demo has to work on
+// a conference network, or none at all.
+const VENDOR = {
+  "/vendor/lightweight-charts.mjs":
+    join(HERE, "node_modules/lightweight-charts/dist/lightweight-charts.standalone.production.mjs"),
+};
 
 const data = new Data(conf);
 await data.connect();
@@ -106,6 +115,40 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  if (url.pathname === "/api/ohlc") {
+    try {
+      const payload = await data.ohlc({
+        symbol: url.searchParams.get("symbol") || symbol || "",
+        interval: url.searchParams.get("interval") ?? "5s",
+        lookback: url.searchParams.get("lookback") ?? "30m",
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(payload, bigints));
+    } catch (error) {
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: String(error?.message ?? error) }));
+    }
+    return;
+  }
+
+  if (url.pathname === "/api/ohlc-options") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      intervals: Object.keys(OHLC_INTERVALS), lookbacks: Object.keys(OHLC_LOOKBACKS),
+    }));
+    return;
+  }
+
+  if (VENDOR[url.pathname]) {
+    try {
+      res.writeHead(200, { "content-type": TYPES[".mjs"] });
+      res.end(await readFile(VENDOR[url.pathname]));
+    } catch {
+      res.writeHead(404).end("vendor file missing; run npm install");
+    }
+    return;
+  }
+
   if (url.pathname === "/api/scan-tables") {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(SCAN_TABLES));
@@ -123,9 +166,11 @@ const server = createServer(async (req, res) => {
     // Rows per query. Bounded so one slice always finishes inside QuestDB's query.timeout;
     // see Data.scan.
     const chunkRows = Number(url.searchParams.get("chunk_rows") ?? 500_000);
+    const projection = url.searchParams.get("projection") ?? "all";
     if (!SCAN_TABLES.includes(table) || !Number.isFinite(rows) || rows < 1
         || !Number.isFinite(readers) || readers < 1 || readers > queryPoolMax
-        || !Number.isFinite(chunkRows) || chunkRows < 1) {
+        || !Number.isFinite(chunkRows) || chunkRows < 1
+        || !(projection in SCAN_PROJECTIONS)) {
       res.writeHead(400, { "content-type": "application/json" });
       res.end(JSON.stringify({
         error: `bad scan request: table=${table} rows=${rows} readers=${readers}` }));
@@ -180,7 +225,7 @@ const server = createServer(async (req, res) => {
     }
 
     try {
-      await data.scan({ table, rows, readers, chunkRows },
+      await data.scan({ table, rows, readers, chunkRows, projection },
                       (p) => send(p.done ? "done" : "progress", p),
                       control.signal);
     } catch (error) {

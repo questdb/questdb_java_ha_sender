@@ -8,6 +8,7 @@
     "start": "node server.mjs"
   },
   "dependencies": {
-    "@questdb/nodejs-client": "file:../../../questdb/nodejs-questdb-client/packages/nodejs-client"
+    "@questdb/nodejs-client": "file:../../../questdb/nodejs-questdb-client/packages/nodejs-client",
+    "lightweight-charts": "^5.2.1"
   }
 }

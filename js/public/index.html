@@ -77,13 +77,18 @@
   .stat b { display:block; font-size:21px; font-weight:600; line-height:1.3;
             font-variant-numeric:tabular-nums; }
   .stat span { color:var(--dim); font-size:11.5px; }
+
+  /* The chart owns its height; the library sizes itself to this box and redraws on resize. */
+  #rt-chart { height:min(62vh, 620px); width:100%; }
+  #ctl-rt input[type=checkbox] { accent-color:var(--hi); margin:0; }
+  #rt-panel { position:relative; }
 </style>
 <header>
   <h1>QuestDB QWP</h1>
   <nav id=tabs>
     <button data-tab=tca class=on>TCA live</button>
     <button data-tab=scan>Streaming scan</button>
-    <button data-tab=rt disabled title="not built yet">Realtime charts</button>
+    <button data-tab=rt>OHLC &amp; VWAP</button>
   </nav>
   <span id=meta></span>
 </header>
@@ -107,6 +112,12 @@
   <select id=scan-table></select>
   <label for=scan-rows>last N rows</label>
   <input type=number id=scan-rows value=200000000 min=1 step=1000000>
+  <label for=scan-projection>columns</label>
+  <select id=scan-projection>
+    <option value=all>all (Gorilla ts)</option>
+    <option value=epoch-long selected>ts as epoch long</option>
+    <option value=no-timestamp>no timestamp</option>
+  </select>
   <label for=scan-readers>readers</label>
   <select id=scan-readers>
     <option>1</option><option>2</option><option selected>4</option>
@@ -118,6 +129,29 @@
 <div id=view-tca>
   <div id=panels></div>
   <div id=charts></div>
+</div>
+
+<div class=ctl id=ctl-rt hidden>
+  <label for=rt-symbol>symbol</label>
+  <select id=rt-symbol></select>
+  <label for=rt-interval>bar</label>
+  <select id=rt-interval></select>
+  <label for=rt-lookback>window</label>
+  <select id=rt-lookback></select>
+  <button class=go id=rt-go>Reload</button>
+  <label for=rt-live>live</label>
+  <input type=checkbox id=rt-live>
+  <button class=sqlbtn id=rt-sql>SQL</button>
+</div>
+
+<div id=view-rt hidden>
+  <div class=stats id=rt-stats></div>
+  <section id=rt-panel>
+    <h2 id=rt-title>OHLC</h2>
+    <div id=rt-chart></div>
+    <div id=rt-note class=sub></div>
+    <pre class=sql id=rt-sqltext hidden></pre>
+  </section>
 </div>
 
 <div id=view-scan hidden>

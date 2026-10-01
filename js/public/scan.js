@@ -11,6 +11,7 @@ import { EPOCH_DIGITS, epochStamp, fmtStructured } from "/format.js";
 
 const tableEl = document.getElementById("scan-table");
 const rowsEl = document.getElementById("scan-rows");
+const projectionEl = document.getElementById("scan-projection");
 const readersEl = document.getElementById("scan-readers");
 const goEl = document.getElementById("scan-go");
 const statsEl = document.getElementById("scan-stats");
@@ -59,7 +60,8 @@ function render(p, state) {
     stat("elapsed", secs(p.ms),
          p.chunks ? `chunk ${int(p.chunksDone)}/${int(p.chunks)}` : ""),
     stat("throughput", `${rate(rowsPerSec)} rows/s`,
-         p.readers ? `${p.readers} reader${p.readers === 1 ? "" : "s"}` : ""),
+         p.readers ? `${p.readers} reader${p.readers === 1 ? "" : "s"}${
+           p.projection && p.projection !== "all" ? ` \u00b7 ${p.projection}` : ""}` : ""),
   ].join("");
 
   const head = (p.columns ?? []).map((c) => `<th>${esc(c)}</th>`).join("");
@@ -84,7 +86,8 @@ function stop() {
 function start() {
   stop();
   const qs = new URLSearchParams({ table: tableEl.value, rows: String(rowsEl.value || 1),
-                                  readers: readersEl.value });
+                                  readers: readersEl.value,
+                                  projection: projectionEl.value });
   const blank = { table: tableEl.value, rows: 0, batches: 0, ms: 0, columns: [], tail: [],
                   sql: "", chunks: 0, chunksDone: 0, readers: Number(readersEl.value) };
   render(blank, "starting");
