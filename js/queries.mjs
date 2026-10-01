@@ -169,7 +169,8 @@ export const OHLC_INTERVALS = {
 
 /** Lookback windows offered, mapped to their span in seconds. */
 export const OHLC_LOOKBACKS = {
-  "5m": 300, "30m": 1800, "2h": 7200, "6h": 21600, "24h": 86400, "7d": 604800,
+  "1m": 60, "2m": 120, "5m": 300, "30m": 1800, "2h": 7200, "6h": 21600, "24h": 86400,
+  "7d": 604800,
 };
 
 /**

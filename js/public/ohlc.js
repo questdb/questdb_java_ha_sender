@@ -17,6 +17,7 @@ const fitEl = document.getElementById("rt-fit");
 const zoomInEl = document.getElementById("rt-zoomin");
 const zoomOutEl = document.getElementById("rt-zoomout");
 const liveEl = document.getElementById("rt-live");
+const tickEl = document.getElementById("rt-tick");
 const sqlBtn = document.getElementById("rt-sql");
 const sqlEl = document.getElementById("rt-sqltext");
 const statsEl = document.getElementById("rt-stats");
@@ -213,7 +214,7 @@ async function tailTick() {
   if (loading || !chart) return;
   try {
     const qs = new URLSearchParams({
-      symbol: symEl.value || "", interval: intervalEl.value, lookback: "5m",
+      symbol: symEl.value || "", interval: intervalEl.value, lookback: "1m",
     });
     const body = await (await fetch(`/api/ohlc?${qs}`)).json();
     if (body.error || !body.rows?.length) return;
@@ -266,7 +267,11 @@ setInterval(showAge, 1000);
 
 function setLive(on) {
   if (timer !== null) { clearInterval(timer); timer = null; }
-  if (on) timer = setInterval(tailTick, 1000);
+  // Polling faster than the bar width is the point: between bar boundaries the newest candle
+  // still grows as trades land, so a 250ms poll on 1s bars redraws it four times before it
+  // closes. At 1000ms the candle only ever appeared finished, which is what made the chart
+  // look like it was barely ticking.
+  if (on) timer = setInterval(tailTick, Number(tickEl.value) || 250);
 }
 
 goEl.addEventListener("click", () => load({ keepView: false }));
@@ -288,6 +293,7 @@ symEl.addEventListener("change", () => load());
 intervalEl.addEventListener("change", () => load());
 lookbackEl.addEventListener("change", () => load());
 liveEl.addEventListener("change", () => setLive(liveEl.checked));
+tickEl.addEventListener("change", () => setLive(liveEl.checked));
 sqlBtn.addEventListener("click", () => {
   sqlEl.hidden = !sqlEl.hidden;
   sqlBtn.textContent = sqlEl.hidden ? "SQL" : "hide";
@@ -295,10 +301,14 @@ sqlBtn.addEventListener("click", () => {
 
 // Populated from the server so the dropdowns cannot offer an interval the query would reject.
 const options = await (await fetch("/api/ohlc-options")).json();
+// Defaults chosen for MOTION, not for coverage. 5s bars over 30m is 360 candles a few
+// pixels wide with a new one every five seconds, which reads as a still image. 1s bars over
+// 5m is one new candle per second at a visible width, and the poll interval matches the bar
+// width so every tick draws something.
 intervalEl.innerHTML = options.intervals
-  .map((i) => `<option${i === "5s" ? " selected" : ""}>${i}</option>`).join("");
+  .map((i) => `<option${i === "1s" ? " selected" : ""}>${i}</option>`).join("");
 lookbackEl.innerHTML = options.lookbacks
-  .map((l) => `<option${l === "30m" ? " selected" : ""}>${l}</option>`).join("");
+  .map((l) => `<option${l === "5m" ? " selected" : ""}>${l}</option>`).join("");
 
 await load();
 setLive(liveEl.checked);   // the tab ships live: a realtime chart should arrive moving

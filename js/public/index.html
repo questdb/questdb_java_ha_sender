@@ -144,6 +144,12 @@
   <button class=go id=rt-fit>Fit</button>
   <label for=rt-live>live</label>
   <input type=checkbox id=rt-live checked>
+  <select id=rt-tick title="how often the live tail polls">
+    <option value=100>100ms</option>
+    <option value=250 selected>250ms</option>
+    <option value=500>500ms</option>
+    <option value=1000>1000ms</option>
+  </select>
   <button class=sqlbtn id=rt-sql>SQL</button>
 </div>
 
@@ -151,6 +157,13 @@
   <div class=stats id=rt-stats></div>
   <section id=rt-panel>
     <h2 id=rt-title>OHLC</h2>
+    <div class=legend id=rt-legend>
+      <span><i style="background:#4ec9a5"></i>up bar</span>
+      <span><i style="background:#e2705f"></i>down bar</span>
+      <span>open / high / low / close of every trade in the bar</span>
+      <span><i style="background:#c98500"></i>session VWAP</span>
+      <span>volume below</span>
+    </div>
     <div id=rt-chart></div>
     <div id=rt-note class=sub></div>
     <div id=rt-hint class=sub>scroll to zoom &middot; drag to pan &middot; double-click to
