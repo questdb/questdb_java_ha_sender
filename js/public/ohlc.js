@@ -13,6 +13,7 @@ const symEl = document.getElementById("rt-symbol");
 const intervalEl = document.getElementById("rt-interval");
 const lookbackEl = document.getElementById("rt-lookback");
 const goEl = document.getElementById("rt-go");
+const fitEl = document.getElementById("rt-fit");
 const liveEl = document.getElementById("rt-live");
 const sqlBtn = document.getElementById("rt-sql");
 const sqlEl = document.getElementById("rt-sqltext");
@@ -69,6 +70,9 @@ function ensureChart() {
   chart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
 
   chart.subscribeCrosshairMove(onCrosshair);
+  // Wheel-zoom has no natural way back, and reloading to escape a zoom would be absurd.
+  // Double-click anywhere on the plot restores the full window, same as the Fit button.
+  chartEl.addEventListener("dblclick", () => chart.timeScale().fitContent());
   new ResizeObserver(() => chart.applyOptions({ width: chartEl.clientWidth }))
     .observe(chartEl);
 }
@@ -215,6 +219,7 @@ function setLive(on) {
 }
 
 goEl.addEventListener("click", () => load({ keepView: false }));
+fitEl.addEventListener("click", () => chart?.timeScale().fitContent());
 symEl.addEventListener("change", () => load());
 intervalEl.addEventListener("change", () => load());
 lookbackEl.addEventListener("change", () => load());

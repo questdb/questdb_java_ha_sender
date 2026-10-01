@@ -191,11 +191,19 @@ FROM fx_trades${symbol ? `\nWHERE symbol = '${symbol}'` : ""}`;
 const window = (fromIso, toIso) =>
   `timestamp >= '${fromIso}' AND timestamp <= '${toIso}'`;
 
-/** Symbols seen in the last half hour of data, for the instrument picker. */
+/**
+ * Symbols traded in the window, busiest first.
+ *
+ * Ordered by activity rather than by name so the tab can open on an instrument that actually
+ * has a candle in most buckets. Opening on whatever sorts first alphabetically gave a chart
+ * full of gaps, which says nothing about either the data or the database.
+ */
 export const ohlcSymbolsSql = (fromIso, toIso) => `
-SELECT symbol FROM fx_trades
+SELECT symbol, count() AS trades
+FROM fx_trades
 WHERE ${window(fromIso, toIso)}
-LATEST ON timestamp PARTITION BY symbol`;
+GROUP BY symbol
+ORDER BY trades DESC`;
 
 /**
  * One bar per interval, plus the volume and the per-bar VWAP.

@@ -225,9 +225,12 @@ export class Data {
       // The picker lists what traded near the anchor, not what is trading now.
       const symFromIso = new Date(lastMs - 1800 * 1000).toISOString();
 
+      // Busiest first from the query; the picker itself is alphabetical because that is how
+      // someone looks an instrument up, but the DEFAULT is the most active one.
       const picker = await this.#run(lease, ohlcSymbolsSql(symFromIso, toIso));
-      const symbols = picker.rows.map((r) => String(r[0])).sort();
-      const chosen = symbol || symbols[0];
+      const byActivity = picker.rows.map((r) => String(r[0]));
+      const symbols = [...byActivity].sort();
+      const chosen = symbol || byActivity[0];
       if (!chosen) {
         return { symbol: null, interval, lookback, columns: [], rows: [], symbols,
                  ms: performance.now() - started, empty: "no symbols in the window" };
