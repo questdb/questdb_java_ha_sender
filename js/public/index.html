@@ -47,6 +47,18 @@
             margin:.35rem 0 .2rem; }
   .legend span { display:flex; align-items:center; gap:.35rem; }
   .legend i { width:9px; height:9px; border-radius:2px; display:inline-block; }
+  /* A changed cell flashes and keeps an arrow. The flash says "this just moved" at a glance
+     across thirty rows; the arrow outlives the flash so direction stays readable after. */
+  @keyframes tick-up   { from { background: rgba(78,201,165,.40); } to { background: none; } }
+  @keyframes tick-down { from { background: rgba(226,112,95,.40); } to { background: none; } }
+  td.up   { animation: tick-up .65s ease-out; }
+  td.down { animation: tick-down .65s ease-out; }
+  td .arrow { font-size:9px; margin-left:.35rem; }
+  td.up .arrow   { color:var(--pos); }
+  td.down .arrow { color:var(--neg); }
+  #rt-book-panel { margin-top:1rem; }
+  #rt-book td, #rt-book th { padding:.1rem .7rem; }
+
   .err { color:var(--neg); }
   .stale { opacity:.45; }
   [hidden] { display:none !important; }
@@ -169,6 +181,14 @@
     <div id=rt-note class=sub></div>
     <div id=rt-hint class=sub>scroll to zoom &middot; drag to pan &middot; double-click to
       reset &middot; drag the axes to stretch them</div>
+  </section>
+
+  <section id=rt-book-panel>
+    <h2>top of book <span id=rt-book-note></span></h2>
+    <table id=rt-book><thead><tr>
+      <th>symbol</th><th>bid</th><th>ask</th><th>spread</th>
+      <th>bid size</th><th>ask size</th>
+    </tr></thead><tbody></tbody></table>
     <pre class=sql id=rt-sqltext hidden></pre>
   </section>
 </div>

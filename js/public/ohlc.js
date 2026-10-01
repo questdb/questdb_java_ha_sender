@@ -25,6 +25,8 @@ const titleEl = document.getElementById("rt-title");
 const noteEl = document.getElementById("rt-note");
 const chartEl = document.getElementById("rt-chart");
 const quoteEl = document.getElementById("rt-quote");
+const bookEl = document.getElementById("rt-book").tBodies[0];
+const bookNoteEl = document.getElementById("rt-book-note");
 
 const INK = "#d7dce3", DIM = "#78828f", LINE = "#242a33", PANEL = "#161a21";
 const UP = "#4ec9a5", DOWN = "#e2705f", VWAP = "#c98500", VOL = "#2f3a4a";
@@ -264,6 +266,7 @@ function openQuoteStream() {
   quoteSource = new EventSource(`/api/quote-stream?${qs}`);
   quoteSource.addEventListener("quote", (ev) => applyQuote(JSON.parse(ev.data)));
   quoteSource.addEventListener("bars", (ev) => applyBars(JSON.parse(ev.data)));
+  quoteSource.addEventListener("book", (ev) => applyBook(JSON.parse(ev.data)));
 }
 
 function closeQuoteStream() {
@@ -331,6 +334,70 @@ function applyBars(body) {
     if (following) chart.timeScale().scrollToRealTime();
     showAge();
   }
+}
+
+// Previous values per symbol, so a cell can tell which way it moved. Rows are built once and
+// then mutated in place: rebuilding the table every update would restart every animation and
+// throw away the flash, which is the entire point of it.
+const bookRows = new Map();
+
+const BOOK_DECIMALS = { spread: 5 };
+
+function cellText(column, value) {
+  if (value === null || value === undefined) return "";
+  const n = Number(value);
+  if (!Number.isFinite(n)) return String(value);
+  if (column.endsWith("volume")) return n.toLocaleString("en-US");
+  if (column === "spread") return n.toFixed(BOOK_DECIMALS.spread);
+  return n.toFixed(n >= 50 ? 3 : 5);
+}
+
+/** Top of book: every instrument, with the cells that just moved flashing. */
+function applyBook(body) {
+  const columns = body.columns ?? [];
+  const ix = Object.fromEntries(columns.map((c, i) => [c, i]));
+  const order = ["bid_price", "ask_price", "spread", "bid_volume", "ask_volume"];
+
+  for (const row of body.rows ?? []) {
+    const symbol = String(row[ix.symbol]);
+    let entry = bookRows.get(symbol);
+    if (!entry) {
+      const tr = document.createElement("tr");
+      const first = document.createElement("td");
+      first.textContent = symbol;
+      tr.append(first);
+      const cells = {};
+      for (const column of order) {
+        const td = document.createElement("td");
+        tr.append(td);
+        cells[column] = td;
+      }
+      // Alphabetical, so a row never jumps position when a price changes.
+      const after = [...bookRows.keys()].concat(symbol).sort()
+        .indexOf(symbol);
+      bookEl.insertBefore(tr, bookEl.children[after] ?? null);
+      entry = { cells, last: {} };
+      bookRows.set(symbol, entry);
+    }
+
+    for (const column of order) {
+      const value = Number(row[ix[column]]);
+      const previous = entry.last[column];
+      const td = entry.cells[column];
+      if (previous === value) continue;
+
+      const direction = previous === undefined ? "" : value > previous ? "up" : "down";
+      td.innerHTML = `${cellText(column, value)}${
+        direction ? `<span class=arrow>${direction === "up" ? "\u25b2" : "\u25bc"}</span>` : ""}`;
+      // Removing the class and forcing a reflow restarts the animation; without it a cell
+      // that moves twice in quick succession only flashes once.
+      td.classList.remove("up", "down");
+      if (direction) { void td.offsetWidth; td.classList.add(direction); }
+      entry.last[column] = value;
+    }
+  }
+  bookNoteEl.textContent = `${(body.rows ?? []).length} instruments \u00b7 ${
+    Math.round(body.ms ?? 0)}ms`;
 }
 
 /**

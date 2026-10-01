@@ -283,3 +283,21 @@ FROM core_price
 WHERE symbol = '${symbol}'
 LATEST ON timestamp PARTITION BY symbol`;
 };
+
+/**
+ * Top of book for every instrument: one row each, newest first.
+ *
+ * This is the liveliest thing on the page, and deliberately so. A single candle advancing
+ * once a second reads as static next to thirty rows whose prices, spreads and volumes all
+ * change at once. LATEST ON walks the symbol index backwards, so it stays one row per symbol
+ * however large the table is, and the few-second window keeps it to instruments actually
+ * quoting rather than every symbol the table has ever seen.
+ */
+export const topOfBookSql = (seconds = 5) => `
+SELECT symbol, bid_price, ask_price,
+    round(ask_price - bid_price, 5) AS spread,
+    bid_volume, ask_volume
+FROM core_price
+WHERE timestamp IN '$now-${Math.max(1, Math.trunc(seconds))}s..$now'
+LATEST ON timestamp PARTITION BY symbol
+ORDER BY symbol`;

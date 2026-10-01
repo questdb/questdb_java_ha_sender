@@ -7,7 +7,7 @@
 import { connectQwpNodeClient, QwpEgressQueryError } from "@questdb/nodejs-client";
 import {
   OHLC_INTERVALS, OHLC_LOOKBACKS, PANELS, ohlcLastRowSql, ohlcSql, ohlcSymbolsSql,
-  latestQuoteSql, ohlcTailSql, scanChunks, sqlFor, symbolsSql,
+  latestQuoteSql, ohlcTailSql, scanChunks, sqlFor, symbolsSql, topOfBookSql,
 } from "./queries.mjs";
 
 /**
@@ -302,6 +302,18 @@ export class Data {
         ask: Number(row[ix.ask]),
         ms: performance.now() - started,
       };
+    } finally {
+      await lease.close();
+    }
+  }
+
+  /** One row per instrument: the whole top of book. */
+  async topOfBook(seconds = 5) {
+    const started = performance.now();
+    const lease = await this.db.borrowQuery();
+    try {
+      const { columns, rows } = await this.#run(lease, topOfBookSql(seconds));
+      return { columns, rows, ms: performance.now() - started };
     } finally {
       await lease.close();
     }

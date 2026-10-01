@@ -229,7 +229,7 @@ const server = createServer(async (req, res) => {
     res.on("close", () => { stop = true; });
 
     // Only CHANGES are sent. A venue that has not moved should not cost a frame.
-    let lastQuote = "", lastBar = "";
+    let lastQuote = "", lastBar = "", lastBook = "";
     (async () => {
       while (!stop) {
         const startedAt = Date.now();
@@ -239,6 +239,15 @@ const server = createServer(async (req, res) => {
           if (key !== lastQuote && Number.isFinite(q.bid)) {
             lastQuote = key;
             res.write(`event: quote\ndata: ${JSON.stringify(q, bigints)}\n\n`);
+          }
+
+          // Every instrument's top of book, pushed on the same connection. Thirty rows
+          // changing at once is what makes a market page feel live; one candle does not.
+          const book = await data.topOfBook(5);
+          const bookKey = JSON.stringify(book.rows, bigints);
+          if (bookKey !== lastBook) {
+            lastBook = bookKey;
+            res.write(`event: book\ndata: ${JSON.stringify(book, bigints)}\n\n`);
           }
 
           const bars = await data.ohlcTail({ symbol: sym, interval, seconds: 60 });
