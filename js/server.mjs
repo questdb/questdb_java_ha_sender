@@ -98,10 +98,24 @@ const server = createServer(async (req, res) => {
 
 server.listen(port, () => console.log(`[js] http://localhost:${port}`));
 
+// Ctrl+C must ALWAYS work. Installing a handler replaces node's default terminate
+// behaviour, so awaiting the QWP close unguarded means a stalled close leaves a process
+// that ignores Ctrl+C entirely and has to be killed by PID. The graceful path is therefore
+// raced against a deadline, and a second signal leaves immediately.
+let stopping = false;
 for (const sig of ["SIGINT", "SIGTERM"]) {
-  process.on(sig, async () => {
+  process.on(sig, () => {
+    if (stopping) process.exit(130);
+    stopping = true;
+    console.log("\n[js] shutting down");
     server.close();
-    await data.close().catch(() => {});
-    process.exit(0);
+    // Keep-alive sockets from the open dashboard would otherwise hold the loop open well
+    // past the last request.
+    server.closeAllConnections?.();
+    const deadline = setTimeout(() => {
+      console.log("[js] close timed out, exiting anyway");
+      process.exit(0);
+    }, 2000);
+    data.close().catch(() => {}).finally(() => { clearTimeout(deadline); process.exit(0); });
   });
 }
