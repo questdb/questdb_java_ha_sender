@@ -36,6 +36,11 @@ const rate = (n) =>
 
 const secs = (ms) => (ms >= 1000 ? `${(ms / 1000).toFixed(2)}s` : `${ms.toFixed(0)}ms`);
 
+// Decoded volume, reported the same way python/read_bench.py does so the two are comparable:
+// GiB for the total a human reads, MB/s and Gb/s for the rate.
+const gib = (b) => b / 1024 ** 3;
+const volume = (b) => (gib(b) >= 1 ? `${gib(b).toFixed(2)} GiB` : `${(b / 1e6).toFixed(0)} MB`);
+
 function fmt(v) {
   if (v === null || v === undefined) return "null";
   if (typeof v === "number") return Number.isInteger(v) ? String(v) : v.toFixed(5);
@@ -62,6 +67,9 @@ function render(p, state) {
     stat("throughput", `${rate(rowsPerSec)} rows/s`,
          p.readers ? `${p.readers} reader${p.readers === 1 ? "" : "s"}${
            p.projection && p.projection !== "all" ? ` \u00b7 ${p.projection}` : ""}` : ""),
+    stat("transfer", p.ms > 0 ? `${((p.bytes ?? 0) * 8 / p.ms / 1e6).toFixed(2)} Gb/s` : "-",
+         `${volume(p.bytes ?? 0)} decoded \u00b7 ${
+           p.ms > 0 ? ((p.bytes ?? 0) / p.ms / 1e3).toFixed(0) : 0} MB/s`),
   ].join("");
 
   const head = (p.columns ?? []).map((c) => `<th>${esc(c)}</th>`).join("");

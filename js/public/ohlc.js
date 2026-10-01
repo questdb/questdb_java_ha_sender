@@ -245,19 +245,38 @@ async function load({ keepView = false } = {}) {
  * replaces the last bar WITHOUT touching the viewport. Re-running setData every second would
  * fight whatever the user is currently zoomed into.
  */
-/** The fast half: one row, so it can be polled as often as the user likes. */
-async function quoteTick() {
-  if (!chart) return;
-  const startedAt = performance.now();
-  try {
-    const qs = new URLSearchParams({ symbol: symEl.value || "" });
-    const q = await (await fetch(`/api/quote?${qs}`)).json();
-    if (q.error || !Number.isFinite(q.bid)) return;
-    pollMs = performance.now() - startedAt;
-    const now = Date.now();
-    pollTimes.push(now);
-    while (pollTimes.length && now - pollTimes[0] > 3000) pollTimes.shift();
+/**
+ * The fast half, PUSHED rather than polled.
+ *
+ * One connection stays open and the server sends a frame whenever the quote changes, so the
+ * browser's distance from the server delays updates by a constant instead of capping their
+ * rate. A laptop 250ms from the server still sees every change the server saw.
+ */
+let quoteSource = null;
 
+function openQuoteStream() {
+  closeQuoteStream();
+  if (!chart) return;
+  const qs = new URLSearchParams({
+    symbol: symEl.value || "", every: String(Number(tickEl.value) || 250),
+  });
+  quoteSource = new EventSource(`/api/quote-stream?${qs}`);
+  quoteSource.addEventListener("quote", (ev) => applyQuote(JSON.parse(ev.data)));
+}
+
+function closeQuoteStream() {
+  quoteSource?.close();
+  quoteSource = null;
+}
+
+function applyQuote(q) {
+  if (!chart || !Number.isFinite(q.bid)) return;
+  const now = Date.now();
+  pollMs = Number(q.ms) || 0;
+  pollTimes.push(now);
+  while (pollTimes.length && now - pollTimes[0] > 3000) pollTimes.shift();
+
+  {
     bidLine.applyOptions({ price: q.bid });
     askLine.applyOptions({ price: q.ask });
     const mid = ((q.bid + q.ask) / 2).toFixed(decimals);
@@ -266,7 +285,7 @@ async function quoteTick() {
       + `ask <b>${q.ask.toFixed(decimals)}</b>&nbsp; mid <b>${mid}</b>&nbsp; `
       + `spread <b>${spread}</b> bps`;
     showAge();
-  } catch { /* a dropped quote is not worth interrupting the chart for */ }
+  }
 }
 
 async function tailTick() {
@@ -362,8 +381,10 @@ function setLive(on) {
   // closes. At 1000ms the candle only ever appeared finished, which is what made the chart
   // look like it was barely ticking.
   if (on) {
-    const every = Number(tickEl.value) || 250;
-    timer = setInterval(() => { quoteTick(); tailTick(); }, every);
+    timer = setInterval(tailTick, 1000);   // bars change once a bar, nothing is gained by more
+    openQuoteStream();
+  } else {
+    closeQuoteStream();
   }
 }
 
@@ -386,11 +407,11 @@ function zoomBy(factor) {
 }
 zoomInEl.addEventListener("click", () => zoomBy(0.6));
 zoomOutEl.addEventListener("click", () => zoomBy(1 / 0.6));
-symEl.addEventListener("change", () => load());
+symEl.addEventListener("change", async () => { await load(); setLive(liveEl.checked); });
 intervalEl.addEventListener("change", () => load());
 lookbackEl.addEventListener("change", () => load());
 liveEl.addEventListener("change", () => setLive(liveEl.checked));
-tickEl.addEventListener("change", () => setLive(liveEl.checked));
+tickEl.addEventListener("change", () => setLive(liveEl.checked));   // restarts the stream
 sqlBtn.addEventListener("click", () => {
   sqlEl.hidden = !sqlEl.hidden;
   sqlBtn.textContent = sqlEl.hidden ? "SQL" : "hide";
@@ -411,7 +432,7 @@ await load();
 setLive(liveEl.checked);   // the tab ships live: a realtime chart should arrive moving
 
 /** Leaving the tab stops the live tail: nothing queries off-screen. */
-export function stopOhlc() { setLive(false); }
+export function stopOhlc() { setLive(false); closeQuoteStream(); }
 export function startOhlc() {
   if (chart) load({ keepView: true });
   setLive(liveEl.checked);

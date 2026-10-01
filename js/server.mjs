@@ -24,6 +24,60 @@ const arg = (name, fallback) => {
   return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : fallback;
 };
 
+// --help before anything else, so it answers without needing a reachable database.
+if (process.argv.includes("--help") || process.argv.includes("-h")) {
+  console.log(`
+questdb-tca-web - three QWP demos over one connection: TCA panels, a streaming
+scan, and a live OHLC chart.
+
+  node server.mjs [options]          npm start -- [options]
+
+CONNECTION
+  --scheme ws|wss          transport; wss turns on TLS            (default ws)
+  --addrs host:port,...    cluster nodes, tried in order with failover
+                                                        (default localhost:9000)
+  --addr host:port         single node; alias for --addrs
+  --token-file PATH        file holding the bearer token. Preferred over putting
+                           a token in the command line, which ps exposes
+  --tls-verify on|unsafe_off
+                           certificate checking, wss only       (default unsafe_off,
+                           because these clusters use self-signed certificates)
+  --compression zstd       compress result batches. Worth ~1.9x on a WAN; a 2.9x
+                           LOSS on a LAN, where the decoder is the bottleneck
+  --max-batch-rows N       rows per result batch
+  --query-pool-max N       concurrent query connections; caps --readers in the
+                           scan tab                                   (default 16)
+  --conf STRING            a full QWP configuration string, overriding all of the
+                           above except --token-file
+
+SERVER
+  --port N                 HTTP port                                (default 8080)
+  --symbol SYM             force every tab to one instrument
+  --help, -h               this text
+
+EXAMPLES
+  node server.mjs
+  node server.mjs --scheme wss --addrs a:9000,b:9000,c:9000 --token-file ~/token.txt
+  npm start -- --port 9999 --symbol EURUSD
+
+HTTP ENDPOINTS
+  /                        the dashboard
+  /api/tick                one pass of the four TCA panels
+  /api/symbols             instruments trading in the last 30s
+  /api/sql?panel=          the exact statement a panel runs
+  /api/scan                streaming scan, server-sent events
+      table= rows= readers= chunk_rows= projection=
+  /api/scan-tables         tables the scan offers
+  /api/ohlc                candles + VWAP for one instrument
+      symbol= interval= lookback=
+  /api/ohlc-tail           newest candles only, one statement
+  /api/ohlc-options        intervals and windows offered
+  /api/quote               newest bid/ask, single row
+  /api/quote-stream        newest bid/ask pushed as they change
+`.trim());
+  process.exit(0);
+}
+
 const port = Number(arg("port", 8080));
 const symbol = arg("symbol", null);
 
@@ -144,6 +198,51 @@ const server = createServer(async (req, res) => {
       res.writeHead(503, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: String(error?.message ?? error) }));
     }
+    return;
+  }
+
+  // Quotes PUSHED over SSE instead of polled.
+  //
+  // A polling browser pays its round trip to this server once per update, so a laptop on a
+  // WAN talking to a server beside QuestDB can never tick faster than that latency allows -
+  // a 250ms timer over a 250ms link is 2 updates a second, not 4. Here the server does the
+  // polling, on the LAN where it costs a few ms, and pushes every change down one already
+  // open connection. The browser's latency then delays the stream by a constant, instead of
+  // dividing its rate.
+  if (url.pathname === "/api/quote-stream") {
+    const sym = url.searchParams.get("symbol") || symbol || "";
+    const everyMs = Math.min(1000, Math.max(50, Number(url.searchParams.get("every") ?? 100)));
+    res.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+      "x-accel-buffering": "no",
+    });
+
+    let stop = false;
+    res.on("close", () => { stop = true; });
+
+    // Only CHANGES are sent. A venue that has not moved should not cost a frame.
+    let lastSent = "";
+    (async () => {
+      while (!stop) {
+        const startedAt = Date.now();
+        try {
+          const q = await data.quote(sym);
+          const key = `${q.bid}|${q.ask}|${q.timestamp}`;
+          if (key !== lastSent && Number.isFinite(q.bid)) {
+            lastSent = key;
+            res.write(`event: quote\ndata: ${JSON.stringify(q, bigints)}\n\n`);
+          }
+        } catch (error) {
+          if (!stop) res.write(`event: failed\ndata: ${JSON.stringify({
+            error: String(error?.message ?? error) })}\n\n`);
+        }
+        const elapsed = Date.now() - startedAt;
+        if (elapsed < everyMs) await new Promise((r) => setTimeout(r, everyMs - elapsed));
+      }
+      res.end();
+    })();
     return;
   }
 

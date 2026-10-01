@@ -28,6 +28,28 @@ function copyTail(batch, sample) {
   return out;
 }
 
+/**
+ * Decoded size of one batch, the Node equivalent of Arrow's `batch.nbytes` that
+ * python/read_bench.py reports, so the two are comparable.
+ *
+ * valuesBytes() and nullBitmapBytes() hand back views over the already-decoded buffers, so
+ * this copies nothing and costs one pass over the COLUMNS, not the rows. SYMBOL returns no
+ * values buffer because its ids are varints on the wire; decoded they are Int32 row ids, so
+ * they are counted as four bytes a row. This is the decoded payload, not the compressed wire
+ * bytes, which the client does not expose. A VARCHAR column would count its offset table but
+ * not its string payload; none of the scanned tables has one.
+ */
+function batchBytes(batch) {
+  let bytes = 0;
+  for (let c = 0; c < batch.columnCount; c++) {
+    const column = batch.column(c);
+    const values = column.valuesBytes();
+    bytes += values ? values.byteLength : column.rowCount * 4;
+    bytes += column.nullBitmapBytes()?.byteLength ?? 0;
+  }
+  return bytes;
+}
+
 export class Data {
   constructor(conf) {
     this.conf = conf;
@@ -124,10 +146,11 @@ export class Data {
     const sqls = scanChunks(table, limit, chunks || Math.max(workers, sliced), projection);
     const started = performance.now();
 
-    let rows = 0, batches = 0, columns = null, tail = [], chunksDone = 0, lastSent = 0;
+    let rows = 0, batches = 0, bytes = 0, columns = null, tail = [], chunksDone = 0;
+    let lastSent = 0;
     const snapshot = (done) => ({
       table, sql: sqls[0] ?? "", chunks: sqls.length, chunksDone, readers: workers,
-      projection,
+      projection, bytes,
       columns, rows, batches, tail, done, ms: performance.now() - started,
     });
 
@@ -149,6 +172,7 @@ export class Data {
             // cost per batch does not depend on how many rows it carries.
             rows += batch.rowCount;
             batches += 1;
+            bytes += batchBytes(batch);
 
             const now = performance.now();
             if (now - lastSent < progressMs) return;
