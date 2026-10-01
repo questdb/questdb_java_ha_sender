@@ -70,8 +70,10 @@ against a remote cluster with the server at 147MB RSS: memory tracks reader coun
 not rows read.
 
 **OHLC & VWAP** — candles with a session VWAP and a volume histogram, zoom and pan by
-wheel, drag or the buttons. Bid and ask arrive on a pushed stream and move between
-candle boundaries.
+wheel, drag or the buttons, double-click or Fit to reset. Candles and bid/ask both
+arrive on one pushed stream; the bid and ask lines move between candle boundaries, so
+there is motion inside the second. Defaults to 1s bars over 1m, chosen for bar width
+rather than coverage.
 
 ## Things worth knowing
 
@@ -89,12 +91,34 @@ arithmetic. Every other fixed-width column is zero copy. The scan tab's `columns
 control trades this off: `all` 2.5M rows/s, `ts as epoch long` 6.3M, `no timestamp`
 8.7M.
 
-**A chart cannot tick faster than the data becomes visible.** Measured against a
-cluster ingesting 26 quotes/s per symbol, the newest visible row advanced exactly
-once per second, in steps. Polling faster than that only re-reads identical data. If
-the chart looks static, read the freshness tile — it reports how far behind the
-newest row is, the measured polls per second, the round trip, and how long since a
-new candle, which is enough to tell the three causes apart.
+**A chart cannot tick faster than the data becomes visible, and that is a property of
+the WRITER.** With a sender on the default `auto_flush_interval=1000`, the newest
+visible row advances in ~1.0s steps however fast rows are produced, and polling
+faster only re-reads identical data: measured 7 distinct values across 43 reads in
+6s. With QWP ingestion flushing every 50ms, the same measurement gave 43 distinct
+values in 43 reads — the limit became the reader's own round trip. Check this before
+blaming the chart; it is one query in a loop.
+
+**Live updates are pushed, not polled, and that is not an optimisation.** A browser
+throttles `setInterval` to 1Hz in a background tab but does not throttle an incoming
+stream: measured in one page at one moment, timer-driven bars ran at 1.0/s while
+stream-driven quotes ran at 5.1/s. Pushing also means a browser far from the server
+sees updates delayed by a constant rather than rate-limited by its round trip. Both
+bars and quotes arrive on one SSE connection, and the poll-rate control sets how
+often the SERVER polls QuestDB.
+
+**Only closed bars are immutable.** The bar currently being formed changes with every
+trade that lands inside it, so it is redrawn at the stream rate. Refreshing bars
+"once per bar" looks correct and pins the newest candle to the bar width instead.
+
+**How alive it looks is mostly bar WIDTH.** 1s bars over 5m is 300 candles a few
+pixels across, where a new one per second is invisible; the same bars over 1m is ~50
+candles of ~30px, where each lands as a step. If it reads as static, widen the bars
+before touching anything else.
+
+If the chart still looks wrong, read the freshness tile: it reports how far behind the
+newest row is, the measured updates per second, the round trip, and how long since a
+new candle, which is enough to tell these causes apart.
 
 **Materialized views may not be readable.** `bbo_1s` and `core_price_1s` return
 `Access denied` for the `kafka` user on the demo cluster, so the app reads base
