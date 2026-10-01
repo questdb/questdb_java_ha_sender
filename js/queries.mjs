@@ -232,3 +232,31 @@ WHERE symbol = '${symbol}'
 SAMPLE BY ${interval}
 ORDER BY timestamp`;
 };
+
+/**
+ * The newest bars only, for the live tail.
+ *
+ * ONE statement, and no anchor query: the tail is for a chart that is keeping up with a live
+ * writer, so $now is the right edge by definition. /api/ohlc runs three statements because it
+ * also has to find where the data ends and which symbols are trading; paying that four times
+ * a second was what made a 250ms poll feel sluggish rather than snappy.
+ */
+export const ohlcTailSql = ({ symbol, interval, seconds = 60 }) => {
+  if (!(interval in OHLC_INTERVALS)) throw new Error(`unknown interval: ${interval}`);
+  if (!symbol) throw new Error("a symbol is required");
+  return `
+SELECT
+    timestamp,
+    first(price) AS open,
+    max(price) AS high,
+    min(price) AS low,
+    last(price) AS close,
+    sum(quantity) AS volume,
+    sum(price * quantity) / sum(quantity) AS vwap,
+    count() AS trades
+FROM fx_trades
+WHERE symbol = '${symbol}'
+    AND timestamp IN '$now-${Math.max(1, Math.trunc(seconds))}s..$now'
+SAMPLE BY ${interval}
+ORDER BY timestamp`;
+};

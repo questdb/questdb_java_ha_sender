@@ -131,6 +131,22 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  if (url.pathname === "/api/ohlc-tail") {
+    try {
+      const payload = await data.ohlcTail({
+        symbol: url.searchParams.get("symbol") || symbol || "",
+        interval: url.searchParams.get("interval") ?? "1s",
+        seconds: Number(url.searchParams.get("seconds") ?? 60),
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(payload, bigints));
+    } catch (error) {
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: String(error?.message ?? error) }));
+    }
+    return;
+  }
+
   if (url.pathname === "/api/ohlc-options") {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({

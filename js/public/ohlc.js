@@ -36,6 +36,10 @@ let chart = null, candles = null, vwapLine = null, volume = null;
 let timer = null, lastBarTime = 0, decimals = 5, loading = false;
 // Running VWAP totals carried past the loaded window, so the live tail can extend the line.
 let vwapPv = 0, vwapQty = 0;
+// How many bars the series holds, and whether the viewport is still parked at the newest one.
+// Zooming or panning away deliberately stops the chart following; sitting at the right edge
+// keeps it following, at whatever zoom the user chose.
+let barCount = 0, following = true;
 
 /** Built once. Rebuilding per reload would throw the viewport away on every parameter change. */
 function ensureChart() {
@@ -80,9 +84,22 @@ function ensureChart() {
   chart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
 
   chart.subscribeCrosshairMove(onCrosshair);
+
+  // The library only auto-shifts while the range sits at the last bar, so zooming in used to
+  // look like the chart had stopped: bars kept arriving, just outside the viewport. Track
+  // whether the right edge is still in view and, when it is, keep pulling the view along.
+  chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
+    if (!range || !barCount) return;
+    following = range.to >= barCount - 2;
+    showFollowing();
+  });
   // Wheel-zoom has no natural way back, and reloading to escape a zoom would be absurd.
   // Double-click anywhere on the plot restores the full window, same as the Fit button.
-  chartEl.addEventListener("dblclick", () => chart.timeScale().fitContent());
+  chartEl.addEventListener("dblclick", () => {
+    chart.timeScale().fitContent();
+    following = true;
+    showFollowing();
+  });
   new ResizeObserver(() => chart.applyOptions({ width: chartEl.clientWidth }))
     .observe(chartEl);
 }
@@ -176,6 +193,9 @@ async function load({ keepView = false } = {}) {
     else chart.timeScale().fitContent();
 
     lastBarTime = bars.at(-1)?.time ?? 0;
+    barCount = bars.length;
+    if (!keepView) following = true;
+    showFollowing();
 
     const span = bars.length
       ? `${new Date(bars[0].time * 1000).toISOString().slice(0, 19).replace("T", " ")} .. ${
@@ -214,9 +234,9 @@ async function tailTick() {
   if (loading || !chart) return;
   try {
     const qs = new URLSearchParams({
-      symbol: symEl.value || "", interval: intervalEl.value, lookback: "1m",
+      symbol: symEl.value || "", interval: intervalEl.value, seconds: "60",
     });
-    const body = await (await fetch(`/api/ohlc?${qs}`)).json();
+    const body = await (await fetch(`/api/ohlc-tail?${qs}`)).json();
     if (body.error || !body.rows?.length) return;
     const { bars, vols } = toSeries(body.columns, body.rows);
     const first = bars.findIndex((b) => b.time >= lastBarTime);
@@ -235,8 +255,11 @@ async function tailTick() {
         vwapQty += barVol;
       }
       if (vwapQty > 0) vwapLine.update({ time: bars[i].time, value: vwapPv / vwapQty });
+      if (bars[i].time > lastBarTime) barCount += 1;
       lastBarTime = bars[i].time;
     }
+    // Pans to the newest bar WITHOUT changing the zoom, so a zoomed-in view keeps ticking.
+    if (following) chart.timeScale().scrollToRealTime();
     showAge();
   } catch { /* a dropped tick is not worth interrupting the chart for */ }
 }
@@ -249,6 +272,17 @@ async function tailTick() {
  * it keeps counting whether or not bars arrive. A number climbing past a few seconds means
  * the writer is idle, not that the chart is broken.
  */
+/** Says whether the chart is tracking the newest bar, because that is not obvious. */
+function showFollowing() {
+  const hint = document.getElementById("rt-hint");
+  if (!hint) return;
+  hint.innerHTML = following
+    ? "scroll to zoom \u00b7 drag to pan \u00b7 double-click to reset \u00b7 "
+      + "<b>following the newest bar</b>"
+    : "scroll to zoom \u00b7 drag to pan \u00b7 "
+      + "<b>scrolled back, not following</b> \u00b7 double-click or Fit to catch up";
+}
+
 function showAge() {
   const tile = document.getElementById("rt-age");
   if (!tile) return;
@@ -275,7 +309,11 @@ function setLive(on) {
 }
 
 goEl.addEventListener("click", () => load({ keepView: false }));
-fitEl.addEventListener("click", () => chart?.timeScale().fitContent());
+fitEl.addEventListener("click", () => {
+  chart?.timeScale().fitContent();
+  following = true;
+  showFollowing();
+});
 
 // Wheel and pinch are the natural gestures, but nothing on screen says so, and a trackpad
 // pinch is not obvious either. These drive the same visible range the wheel does.

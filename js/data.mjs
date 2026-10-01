@@ -7,7 +7,7 @@
 import { connectQwpNodeClient, QwpEgressQueryError } from "@questdb/nodejs-client";
 import {
   OHLC_INTERVALS, OHLC_LOOKBACKS, PANELS, ohlcLastRowSql, ohlcSql, ohlcSymbolsSql,
-  scanChunks, sqlFor, symbolsSql,
+  ohlcTailSql, scanChunks, sqlFor, symbolsSql,
 } from "./queries.mjs";
 
 /**
@@ -244,6 +244,19 @@ export class Data {
         from: fromIso, to: toIso,
         ms: performance.now() - started,
       };
+    } finally {
+      await lease.close();
+    }
+  }
+
+  /** The live tail: one statement, one lease, nothing else. */
+  async ohlcTail({ symbol, interval = "1s", seconds = 60 }) {
+    const started = performance.now();
+    const lease = await this.db.borrowQuery();
+    try {
+      const bars = await this.#run(lease, ohlcTailSql({ symbol, interval, seconds }));
+      return { symbol, interval, columns: bars.columns, rows: bars.rows,
+               ms: performance.now() - started };
     } finally {
       await lease.close();
     }
