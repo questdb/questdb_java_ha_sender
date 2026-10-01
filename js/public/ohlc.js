@@ -419,14 +419,15 @@ sqlBtn.addEventListener("click", () => {
 
 // Populated from the server so the dropdowns cannot offer an interval the query would reject.
 const options = await (await fetch("/api/ohlc-options")).json();
-// Defaults chosen for MOTION, not for coverage. 5s bars over 30m is 360 candles a few
-// pixels wide with a new one every five seconds, which reads as a still image. 1s bars over
-// 5m is one new candle per second at a visible width, and the poll interval matches the bar
-// width so every tick draws something.
+// Defaults chosen for MOTION, not for coverage. What makes a candle chart look alive is how
+// WIDE each bar is: a new bar per second reads as a step when bars are tens of pixels across
+// and as nothing when they are five. The console panel this was compared against fits 20 bars
+// into ~650px, about 30px each; this chart is roughly 1500px, so ~60 bars matches that. Hence
+// 1s bars over 1m, with 20s and 30s for a closer look and minutes-to-days for context.
 intervalEl.innerHTML = options.intervals
   .map((i) => `<option${i === "1s" ? " selected" : ""}>${i}</option>`).join("");
 lookbackEl.innerHTML = options.lookbacks
-  .map((l) => `<option${l === "5m" ? " selected" : ""}>${l}</option>`).join("");
+  .map((l) => `<option${l === "1m" ? " selected" : ""}>${l}</option>`).join("");
 
 await load();
 setLive(liveEl.checked);   // the tab ships live: a realtime chart should arrive moving

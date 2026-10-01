@@ -168,9 +168,14 @@ export const OHLC_INTERVALS = {
 };
 
 /** Lookback windows offered, mapped to their span in seconds. */
+// Short windows first, and they are the point. How alive a candle chart looks is governed by
+// how WIDE each bar is, not by how fast the data arrives: 1s bars over 5m is 300 candles a
+// few pixels across, where a new one per second is invisible, while the same bars over 20s
+// is 20 candles filling the chart and each one lands as a visible step. The QuestDB console
+// panel this was compared against uses a 20s window.
 export const OHLC_LOOKBACKS = {
-  "1m": 60, "2m": 120, "5m": 300, "30m": 1800, "2h": 7200, "6h": 21600, "24h": 86400,
-  "7d": 604800,
+  "20s": 20, "30s": 30, "1m": 60, "2m": 120, "5m": 300, "30m": 1800, "2h": 7200,
+  "6h": 21600, "24h": 86400, "7d": 604800,
 };
 
 /**
