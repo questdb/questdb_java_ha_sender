@@ -139,9 +139,11 @@
   <label for=rt-lookback>window</label>
   <select id=rt-lookback></select>
   <button class=go id=rt-go>Reload</button>
+  <button class=go id=rt-zoomin title="zoom in">+</button>
+  <button class=go id=rt-zoomout title="zoom out">&minus;</button>
   <button class=go id=rt-fit>Fit</button>
   <label for=rt-live>live</label>
-  <input type=checkbox id=rt-live>
+  <input type=checkbox id=rt-live checked>
   <button class=sqlbtn id=rt-sql>SQL</button>
 </div>
 
@@ -151,6 +153,8 @@
     <h2 id=rt-title>OHLC</h2>
     <div id=rt-chart></div>
     <div id=rt-note class=sub></div>
+    <div id=rt-hint class=sub>scroll to zoom &middot; drag to pan &middot; double-click to
+      reset &middot; drag the axes to stretch them</div>
     <pre class=sql id=rt-sqltext hidden></pre>
   </section>
 </div>

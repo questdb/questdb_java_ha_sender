@@ -14,6 +14,8 @@ const intervalEl = document.getElementById("rt-interval");
 const lookbackEl = document.getElementById("rt-lookback");
 const goEl = document.getElementById("rt-go");
 const fitEl = document.getElementById("rt-fit");
+const zoomInEl = document.getElementById("rt-zoomin");
+const zoomOutEl = document.getElementById("rt-zoomout");
 const liveEl = document.getElementById("rt-live");
 const sqlBtn = document.getElementById("rt-sql");
 const sqlEl = document.getElementById("rt-sqltext");
@@ -31,6 +33,8 @@ const int = (n) => Number(n).toLocaleString("en-US");
 
 let chart = null, candles = null, vwapLine = null, volume = null;
 let timer = null, lastBarTime = 0, decimals = 5, loading = false;
+// Running VWAP totals carried past the loaded window, so the live tail can extend the line.
+let vwapPv = 0, vwapQty = 0;
 
 /** Built once. Rebuilding per reload would throw the viewport away on every parameter change. */
 function ensureChart() {
@@ -40,7 +44,12 @@ function ensureChart() {
               fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" },
     grid: { vertLines: { color: LINE }, horzLines: { color: LINE } },
     rightPriceScale: { borderColor: LINE },
-    timeScale: { borderColor: LINE, timeVisible: true, secondsVisible: true },
+    timeScale: {
+      borderColor: LINE, timeVisible: true, secondsVisible: true,
+      // A live chart that does not follow the newest bar is just a static one that happens
+      // to be mutating off-screen.
+      shiftVisibleRangeOnNewBar: true, rightOffset: 3,
+    },
     crosshair: { mode: 0 },   // free crosshair: read any price, not just a bar's close
     // The point of the tab: wheel-zoom, drag-pan and pinch all on, with kinetic scrolling
     // so a flick keeps gliding.
@@ -114,7 +123,7 @@ function toSeries(columns, rows) {
     if (qty > 0) vwaps.push({ time, value: pv / qty });
     vols.push({ time, value: vol, color: close >= open ? "#1f3f38" : "#3f2420" });
   }
-  return { bars, vwaps, vols };
+  return { bars, vwaps, vols, pv, qty };
 }
 
 /** FX quotes need five decimals; JPY crosses need three. Taken from the data, not guessed. */
@@ -148,7 +157,10 @@ async function load({ keepView = false } = {}) {
     sqlEl.textContent = body.sql ?? "";
 
     ensureChart();
-    const { bars, vwaps, vols } = toSeries(body.columns ?? [], body.rows ?? []);
+    const series = toSeries(body.columns ?? [], body.rows ?? []);
+    const { bars, vwaps, vols } = series;
+    vwapPv = series.pv;
+    vwapQty = series.qty;
     decimals = decimalsFor(bars);
     candles.applyOptions({ priceFormat: { type: "price", precision: decimals,
                                           minMove: Number(`1e-${decimals}`) } });
@@ -177,7 +189,9 @@ async function load({ keepView = false } = {}) {
       stat("query", `${Math.round(body.ms)}ms`, "3 statements, 1 connection"),
       stat("last", bars.at(-1) ? bars.at(-1).close.toFixed(decimals) : "-",
            vwaps.at(-1) ? `vwap ${vwaps.at(-1).value.toFixed(decimals)}` : ""),
+      `<div class=stat id=rt-age><b>-</b><span>newest row</span></div>`,
     ].join("");
+    showAge();
     noteEl.textContent = bars.length ? "" : (body.empty ?? "no bars in this window");
   } catch (error) {
     statsEl.innerHTML = "";
@@ -204,14 +218,51 @@ async function tailTick() {
     const body = await (await fetch(`/api/ohlc?${qs}`)).json();
     if (body.error || !body.rows?.length) return;
     const { bars, vols } = toSeries(body.columns, body.rows);
-    for (const bar of bars) {
-      if (bar.time < lastBarTime) continue;   // update() refuses to go backwards
-      candles.update(bar);
-      lastBarTime = bar.time;
+    const first = bars.findIndex((b) => b.time >= lastBarTime);
+    if (first < 0) return;
+    for (let i = first; i < bars.length; i++) {
+      candles.update(bars[i]);
+      const vol = vols[i];
+      if (vol) volume.update(vol);
+      // Extend the session VWAP too. It is accumulated over the LOADED window, so the tail's
+      // own running total cannot be reused; this carries the line forward from the totals the
+      // full load ended on. Without it the one line meant to move stopped at load time.
+      const barVwap = Number(body.rows[i]?.[body.columns.indexOf("vwap")]);
+      const barVol = Number(body.rows[i]?.[body.columns.indexOf("volume")]) || 0;
+      if (Number.isFinite(barVwap) && bars[i].time > lastBarTime) {
+        vwapPv += barVwap * barVol;
+        vwapQty += barVol;
+      }
+      if (vwapQty > 0) vwapLine.update({ time: bars[i].time, value: vwapPv / vwapQty });
+      lastBarTime = bars[i].time;
     }
-    for (const v of vols) if (v.time >= lastBarTime) volume.update(v);
+    showAge();
   } catch { /* a dropped tick is not worth interrupting the chart for */ }
 }
+
+/**
+ * How far behind the newest row is.
+ *
+ * "The chart looks static" has two completely different causes: the page is not tailing, or
+ * nothing is being written. Without this they are indistinguishable, so the age is shown and
+ * it keeps counting whether or not bars arrive. A number climbing past a few seconds means
+ * the writer is idle, not that the chart is broken.
+ */
+function showAge() {
+  const tile = document.getElementById("rt-age");
+  if (!tile) return;
+  if (!lastBarTime) { tile.innerHTML = "<b>-</b><span>newest row</span>"; return; }
+  const seconds = Math.max(0, Math.round(Date.now() / 1000 - lastBarTime));
+  const text = seconds < 90 ? `${seconds}s`
+    : seconds < 5400 ? `${Math.round(seconds / 60)}m`
+    : `${(seconds / 3600).toFixed(1)}h`;
+  const state = seconds <= 15 ? "live" : "writer idle or paused";
+  tile.innerHTML = `<b>${text}</b><span>behind newest row &middot; ${state}</span>`;
+}
+
+// Ticks regardless of whether data arrives, so a stalled writer shows as a rising number
+// rather than as a page that appears frozen.
+setInterval(showAge, 1000);
 
 function setLive(on) {
   if (timer !== null) { clearInterval(timer); timer = null; }
@@ -220,6 +271,19 @@ function setLive(on) {
 
 goEl.addEventListener("click", () => load({ keepView: false }));
 fitEl.addEventListener("click", () => chart?.timeScale().fitContent());
+
+// Wheel and pinch are the natural gestures, but nothing on screen says so, and a trackpad
+// pinch is not obvious either. These drive the same visible range the wheel does.
+function zoomBy(factor) {
+  const scale = chart?.timeScale();
+  const range = scale?.getVisibleLogicalRange();
+  if (!range) return;
+  const middle = (range.from + range.to) / 2;
+  const half = ((range.to - range.from) / 2) * factor;
+  scale.setVisibleLogicalRange({ from: middle - half, to: middle + half });
+}
+zoomInEl.addEventListener("click", () => zoomBy(0.6));
+zoomOutEl.addEventListener("click", () => zoomBy(1 / 0.6));
 symEl.addEventListener("change", () => load());
 intervalEl.addEventListener("change", () => load());
 lookbackEl.addEventListener("change", () => load());
@@ -237,7 +301,11 @@ lookbackEl.innerHTML = options.lookbacks
   .map((l) => `<option${l === "30m" ? " selected" : ""}>${l}</option>`).join("");
 
 await load();
+setLive(liveEl.checked);   // the tab ships live: a realtime chart should arrive moving
 
 /** Leaving the tab stops the live tail: nothing queries off-screen. */
-export function stopOhlc() { setLive(false); liveEl.checked = false; }
-export function startOhlc() { if (chart) load({ keepView: true }); }
+export function stopOhlc() { setLive(false); }
+export function startOhlc() {
+  if (chart) load({ keepView: true });
+  setLive(liveEl.checked);
+}
