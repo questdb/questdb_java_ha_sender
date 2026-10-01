@@ -11,6 +11,16 @@ import os
 
 import questdb
 
+import warnings
+
+# The QWP client's to_polars() casts symbol columns into a per-connection Categorical, which
+# polars now deprecates in favour of .cat.to(). The cast happens inside the client, not here,
+# so suppressing it is all this script can do; a dashboard that reprints every tick would
+# otherwise be buried in it. Matched on the message so other deprecations still surface.
+warnings.filterwarnings(
+    "ignore", category=DeprecationWarning, message="casting from UInt32 to Categorical"
+)
+
 SQL = """
 SELECT
     t.timestamp,
