@@ -1,0 +1,14 @@
+{
+  "name": "questdb-tca-web",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser TCA dashboard: slippage, markout curves and local min/max over QWP",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "@questdb/nodejs-client": "file:../../../questdb/nodejs-questdb-client/packages/nodejs-client",
+    "lightweight-charts": "^5.2.1"
+  }
+}

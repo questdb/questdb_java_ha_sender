@@ -1,0 +1,201 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>QuestDB QWP demos</title>
+<style>
+  :root { color-scheme: dark;
+          --bg:#0f1216; --panel:#161a21; --fg:#d7dce3; --dim:#78828f;
+          --line:#242a33; --pos:#4ec9a5; --neg:#e2705f; --hi:#8ab4f8; }
+  * { box-sizing: border-box; }
+  body { background:var(--bg); color:var(--fg); margin:0; padding:1rem 1.25rem 2rem;
+         font:12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+  header { display:flex; align-items:center; gap:1rem; flex-wrap:wrap;
+           margin-bottom:1rem; padding-bottom:.75rem; border-bottom:1px solid var(--line); }
+  h1 { font-size:13px; font-weight:600; margin:0; letter-spacing:.02em; }
+  header label { color:var(--dim); }
+  select { background:var(--panel); color:var(--fg); border:1px solid var(--line);
+           border-radius:4px; padding:.25rem .5rem; font:inherit; }
+  #meta { margin-left:auto; color:var(--dim); }
+
+  /* Two columns on anything wide enough, one below that. The panels are independent, so a
+     grid lets all four sit on one screen instead of scrolling. */
+  #panels { display:grid; gap:1rem; grid-template-columns:repeat(auto-fit, minmax(540px, 1fr)); }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:6px;
+            padding:.75rem .9rem; min-width:0; overflow-x:auto; }
+  h2 { font-size:12px; font-weight:600; margin:0 0 .1rem; color:var(--hi); }
+  h2 span { color:var(--dim); font-weight:400; }
+  .sub { color:var(--dim); margin:.55rem 0 .25rem; font-size:11.5px; }
+
+  table { border-collapse:collapse; font-variant-numeric:tabular-nums; width:100%; }
+  th, td { padding:.13rem .55rem; border-bottom:1px solid var(--line); text-align:right;
+           white-space:nowrap; }
+  th { color:var(--dim); font-weight:600; position:sticky; top:0; background:var(--panel); }
+  th:first-child, td:first-child { text-align:left; }
+  td.pos { color:var(--pos); } td.neg { color:var(--neg); }
+  caption { caption-side:bottom; color:var(--dim); text-align:left; padding-top:.3rem; }
+
+  .sqlbtn { float:right; background:none; border:1px solid var(--line); color:var(--dim);
+            border-radius:4px; font:inherit; font-size:11px; padding:0 .45rem; cursor:pointer; }
+  .sqlbtn:hover { color:var(--fg); border-color:var(--dim); }
+  pre.sql { background:#0b0e12; border:1px solid var(--line); border-radius:4px;
+            padding:.6rem .7rem; margin:.5rem 0 0; overflow-x:auto; color:#9fb4cc;
+            font-size:11.5px; white-space:pre; }
+  #charts { display:grid; gap:1rem; margin-top:1rem;
+            grid-template-columns:repeat(auto-fit, minmax(540px, 1fr)); }
+  #charts section { padding-bottom:.5rem; }
+  .legend { display:flex; gap:1rem; flex-wrap:wrap; color:var(--dim); font-size:11.5px;
+            margin:.35rem 0 .2rem; }
+  .legend span { display:flex; align-items:center; gap:.35rem; }
+  .legend i { width:9px; height:9px; border-radius:2px; display:inline-block; }
+  /* A changed cell flashes and keeps an arrow. The flash says "this just moved" at a glance
+     across thirty rows; the arrow outlives the flash so direction stays readable after. */
+  @keyframes tick-up   { from { background: rgba(78,201,165,.40); } to { background: none; } }
+  @keyframes tick-down { from { background: rgba(226,112,95,.40); } to { background: none; } }
+  td.up   { animation: tick-up .65s ease-out; }
+  td.down { animation: tick-down .65s ease-out; }
+  td .arrow { font-size:9px; margin-left:.35rem; }
+  td.up .arrow   { color:var(--pos); }
+  td.down .arrow { color:var(--neg); }
+  #rt-book-panel { margin-top:1rem; }
+  #rt-book td, #rt-book th { padding:.1rem .7rem; }
+
+  .err { color:var(--neg); }
+  .stale { opacity:.45; }
+  [hidden] { display:none !important; }
+
+  nav#tabs { display:flex; gap:.35rem; }
+  nav#tabs button { background:none; border:1px solid var(--line); color:var(--dim);
+                    border-radius:4px; font:inherit; padding:.25rem .7rem; cursor:pointer; }
+  nav#tabs button.on { color:var(--fg); border-color:var(--hi); }
+  nav#tabs button[disabled] { opacity:.4; cursor:not-allowed; }
+
+  /* Each tab owns a control row; only the active tab's is mounted, which is also the rule
+     for its queries. */
+  .ctl { display:flex; align-items:center; gap:1rem; flex-wrap:wrap; margin-bottom:1rem; }
+  .ctl label { color:var(--dim); }
+  input[type=number] { background:var(--panel); color:var(--fg); border:1px solid var(--line);
+                       border-radius:4px; padding:.25rem .5rem; font:inherit; width:9rem;
+                       font-variant-numeric:tabular-nums; }
+  button.go { background:var(--panel); border:1px solid var(--line); color:var(--fg);
+              border-radius:4px; font:inherit; padding:.25rem .9rem; cursor:pointer; }
+  button.go:hover { border-color:var(--dim); }
+
+  /* Four numbers ARE the dashboard here, so they are stat tiles rather than a chart: there
+     is no shape to read, only magnitudes that change. */
+  .stats { display:grid; gap:1rem; margin-bottom:1rem;
+           grid-template-columns:repeat(auto-fit, minmax(190px, 1fr)); }
+  .stat { background:var(--panel); border:1px solid var(--line); border-radius:6px;
+          padding:.7rem .9rem; }
+  .stat b { display:block; font-size:21px; font-weight:600; line-height:1.3;
+            font-variant-numeric:tabular-nums; }
+  .stat span { color:var(--dim); font-size:11.5px; }
+
+  /* The chart owns its height; the library sizes itself to this box and redraws on resize. */
+  #rt-chart { height:min(62vh, 620px); width:100%; }
+  #ctl-rt input[type=checkbox] { accent-color:var(--hi); margin:0; }
+  #rt-panel { position:relative; }
+</style>
+<header>
+  <h1>QuestDB QWP</h1>
+  <nav id=tabs>
+    <button data-tab=tca class=on>TCA live</button>
+    <button data-tab=scan>Streaming scan</button>
+    <button data-tab=rt>OHLC &amp; VWAP</button>
+  </nav>
+  <span id=meta></span>
+</header>
+
+<div class=ctl id=ctl-tca>
+  <label for=sym>symbol</label>
+  <select id=sym><option value="">ALL</option></select>
+  <label for=refresh>refresh</label>
+  <select id=refresh>
+    <option value=250>250ms</option>
+    <option value=500>500ms</option>
+    <option value=750>750ms</option>
+    <option value=1000>1000ms</option>
+    <option value=2000>2000ms</option>
+    <option value=0>Off</option>
+  </select>
+</div>
+
+<div class=ctl id=ctl-scan hidden>
+  <label for=scan-table>table</label>
+  <select id=scan-table></select>
+  <label for=scan-rows>last N rows</label>
+  <input type=number id=scan-rows value=200000000 min=1 step=1000000>
+  <label for=scan-projection>columns</label>
+  <select id=scan-projection>
+    <option value=all>all (Gorilla ts)</option>
+    <option value=epoch-long selected>ts as epoch long</option>
+    <option value=no-timestamp>no timestamp</option>
+  </select>
+  <label for=scan-readers>readers</label>
+  <select id=scan-readers>
+    <option>1</option><option>2</option><option>4</option>
+    <option selected>8</option><option>16</option>
+  </select>
+  <button class=go id=scan-go>Start scan</button>
+</div>
+
+<div id=view-tca>
+  <div id=panels></div>
+  <div id=charts></div>
+</div>
+
+<div class=ctl id=ctl-rt hidden>
+  <label for=rt-symbol>symbol</label>
+  <select id=rt-symbol></select>
+  <label for=rt-interval>bar</label>
+  <select id=rt-interval></select>
+  <label for=rt-lookback>window</label>
+  <select id=rt-lookback></select>
+  <button class=go id=rt-go>Reload</button>
+  <button class=go id=rt-zoomin title="zoom in">+</button>
+  <button class=go id=rt-zoomout title="zoom out">&minus;</button>
+  <button class=go id=rt-fit>Fit</button>
+  <label for=rt-live>live</label>
+  <input type=checkbox id=rt-live checked>
+  <select id=rt-tick title="how often the live tail polls">
+    <option value=100>100ms</option>
+    <option value=250 selected>250ms</option>
+    <option value=500>500ms</option>
+    <option value=1000>1000ms</option>
+  </select>
+  <button class=sqlbtn id=rt-sql>SQL</button>
+</div>
+
+<div id=view-rt hidden>
+  <div class=stats id=rt-stats></div>
+  <section id=rt-panel>
+    <h2 id=rt-title>OHLC</h2>
+    <div class=legend id=rt-legend>
+      <span><i style="background:#4ec9a5"></i>up bar</span>
+      <span><i style="background:#e2705f"></i>down bar</span>
+      <span>open / high / low / close of every trade in the bar</span>
+      <span><i style="background:#c98500"></i>session VWAP</span>
+      <span>volume below</span>
+    </div>
+    <div id=rt-chart></div>
+    <div id=rt-quote class=sub></div>
+    <div id=rt-note class=sub></div>
+    <div id=rt-hint class=sub>scroll to zoom &middot; drag to pan &middot; double-click to
+      reset &middot; drag the axes to stretch them</div>
+  </section>
+
+  <section id=rt-book-panel>
+    <h2>top of book <span id=rt-book-note></span></h2>
+    <table id=rt-book><thead><tr>
+      <th>symbol</th><th>bid</th><th>ask</th><th>spread</th>
+      <th>bid size</th><th>ask size</th>
+    </tr></thead><tbody></tbody></table>
+    <pre class=sql id=rt-sqltext hidden></pre>
+  </section>
+</div>
+
+<div id=view-scan hidden>
+  <div class=stats id=scan-stats></div>
+  <section id=scan-panel></section>
+</div>
+
+<script type="module" src="/app.js"></script>
