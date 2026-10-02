@@ -75,6 +75,15 @@ async function scan(chunkRows, readers) {
   return { slices: sqls.length, rows: seen, ms, rate: (seen / ms) * 1000 };
 }
 
+// Warm-up, discarded. V8 needs a few thousand iterations to optimise the decode loops, and
+// the sweep runs slice sizes in the outer loop, so without this the FIRST cell pays the whole
+// JIT cost and the smallest slice size looks slow for a reason that has nothing to do with
+// slicing. The server side is usually already warm, since the newest rows were just written.
+process.stdout.write("warming up");
+await scan(Math.max(...chunkSizes), Math.max(...readerCounts));
+await scan(Math.min(...chunkSizes), Math.max(...readerCounts));
+process.stdout.write(" done\n");
+
 const results = [];
 for (const chunkRows of chunkSizes) {
   for (const readers of readerCounts) {
