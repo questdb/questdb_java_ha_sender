@@ -22,27 +22,67 @@ changes.
 Two dependencies: the QWP client, and TradingView Lightweight Charts for the OHLC
 tab. No framework, no bundler, no build step — the page is plain ES modules.
 
-The client is not on npm yet, so build it from source:
+### 1. Build the client from source
+
+`@questdb/nodejs-client` is not published yet, so it has to be built. Clone it
+anywhere you like; `$CLIENT` below stands for wherever that is.
 
 ```sh
-git clone <nodejs-questdb-client> && cd nodejs-questdb-client
-pnpm install                                   # needs Node >= 20.18.1
+git clone https://github.com/questdb/nodejs-questdb-client.git
+cd nodejs-questdb-client
+CLIENT=$(pwd)
+
+corepack enable && corepack prepare pnpm@10.12.4 --activate   # or: npm i -g pnpm
+pnpm install                                                  # needs Node >= 20.18.1
 pnpm --filter @questdb/nodejs-client build
 ```
 
-`pnpm install` at the **root** is required first: `bunchee`, `rollup` and
-`typescript` are devDependencies of the workspace, so building from inside
-`packages/nodejs-client` will not resolve them.
+Three things that bite:
 
-Then point this app at wherever you cloned it and install:
+- **`pnpm install` at the repo ROOT is required first.** `bunchee`, `rollup` and
+  `typescript` are devDependencies of the workspace, so building from inside
+  `packages/nodejs-client` cannot resolve them.
+- **Node must be 20.18.1 or newer**, which the package enforces. Distro Node is
+  often 18 — check `node --version` before blaming the build.
+- The build writes `packages/nodejs-client/dist/`, which is what this app consumes.
+
+### 2. Point this app at it
 
 ```sh
-cd js
-npm pkg set dependencies.@questdb/nodejs-client=file:/path/to/nodejs-questdb-client/packages/nodejs-client
+cd /path/to/questdb_java_ha_sender/js
+npm pkg set dependencies.@questdb/nodejs-client="file:$CLIENT/packages/nodejs-client"
 npm install
 ```
 
-That edits one line of `package.json`; it is a local diff, not something to commit.
+That rewrites one line of `package.json` to a path that is local to your machine.
+**Do not commit it** — the committed value is whatever the last person's layout
+happened to be, and it is expected to be wrong for you.
+
+### 3. Rebuilding the client afterwards
+
+This matters whenever you are comparing client branches, because getting it wrong
+produces an A/B that silently compares a build against itself.
+
+- **With npm**, a `file:` dependency is installed as a SYMLINK. Rebuild the client,
+  restart the server, done.
+- **With pnpm**, it is a hard-linked COPY under `node_modules/.pnpm/`. A rebuild
+  writes new files, which breaks the link, so the app keeps running the old build —
+  and `pnpm install --force` will not fix it, because the dependency's version has
+  not changed. Either re-add it with pnpm's `link:` protocol, which does symlink:
+
+  ```sh
+  pnpm add "@questdb/nodejs-client@link:$CLIENT/packages/nodejs-client"
+  ```
+
+  or delete `node_modules` and install again. Note `link:` is a pnpm/yarn protocol;
+  npm ignores it silently and installs nothing, so do not commit that either.
+
+**Verify, every time, before trusting a measurement.** The two hashes must match:
+
+```sh
+md5sum "$CLIENT/packages/nodejs-client/dist/es/index.mjs"
+md5sum "$(readlink -f node_modules/@questdb/nodejs-client)/dist/es/index.mjs"
+```
 
 ## Run
 
