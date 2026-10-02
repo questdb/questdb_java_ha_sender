@@ -49,8 +49,8 @@ console.log(`${table} (${projection}), last ${rows.toLocaleString("en-US")} rows
 const db = await connectQwpNodeClient(conf);
 
 /** One scan at a given slice size and reader count. Mirrors Data.scan's work queue. */
-async function scan(chunkRows, readers) {
-  const sqls = scanChunks(table, rows, Math.max(readers, Math.ceil(rows / chunkRows)),
+async function scanRows(limit, chunkRows, readers) {
+  const sqls = scanChunks(table, limit, Math.max(readers, Math.ceil(limit / chunkRows)),
                           projection);
   const queue = sqls.slice();
   let seen = 0;
@@ -79,9 +79,13 @@ async function scan(chunkRows, readers) {
 // the sweep runs slice sizes in the outer loop, so without this the FIRST cell pays the whole
 // JIT cost and the smallest slice size looks slow for a reason that has nothing to do with
 // slicing. The server side is usually already warm, since the newest rows were just written.
+// A fixed small sample, not `rows`: warming up on a 200M-row scan costs half a minute and
+// buys nothing a few million rows has not already bought.
+const WARMUP_ROWS = Math.min(rows, 2_000_000);
 process.stdout.write("warming up");
-await scan(Math.max(...chunkSizes), Math.max(...readerCounts));
-await scan(Math.min(...chunkSizes), Math.max(...readerCounts));
+for (const size of [Math.max(...chunkSizes), Math.min(...chunkSizes)]) {
+  await scanRows(WARMUP_ROWS, size, Math.max(...readerCounts));
+}
 process.stdout.write(" done\n");
 
 const results = [];
@@ -89,8 +93,8 @@ for (const chunkRows of chunkSizes) {
   for (const readers of readerCounts) {
     try {
       // Best of two: one run on a shared cluster says very little.
-      const a = await scan(chunkRows, readers);
-      const b = await scan(chunkRows, readers);
+      const a = await scanRows(rows, chunkRows, readers);
+      const b = await scanRows(rows, chunkRows, readers);
       const best = a.rate > b.rate ? a : b;
       results.push({ chunkRows, readers, ...best });
       process.stdout.write(".");

@@ -314,10 +314,13 @@ const server = createServer(async (req, res) => {
   if (url.pathname === "/api/scan") {
     const table = url.searchParams.get("table") ?? SCAN_TABLES[0];
     const rows = Number(url.searchParams.get("rows") ?? 200_000_000);
-    const readers = Number(url.searchParams.get("readers") ?? 4);
+    const readers = Number(url.searchParams.get("readers") ?? 8);
     // Rows per query. Bounded so one slice always finishes inside QuestDB's query.timeout;
-    // see Data.scan.
-    const chunkRows = Number(url.searchParams.get("chunk_rows") ?? 500_000);
+    // see Data.scan. Measured on a same-AZ cluster, slice size makes no difference at all
+    // (40 statements and 1 statement landed within noise of each other at every reader
+    // count), so this is sized for timeout headroom rather than for throughput: 2M rows is
+    // about a second a slice there, against a 60s cap.
+    const chunkRows = Number(url.searchParams.get("chunk_rows") ?? 2_000_000);
     const projection = url.searchParams.get("projection") ?? "all";
     if (!SCAN_TABLES.includes(table) || !Number.isFinite(rows) || rows < 1
         || !Number.isFinite(readers) || readers < 1 || readers > queryPoolMax

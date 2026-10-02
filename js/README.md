@@ -81,15 +81,34 @@ rather than coverage.
 bandwidth is the constraint, and costs 2.9x on a LAN, where it is not: the client's
 zstd decoder is pure JavaScript on the event-loop thread.
 
-**Readers do not scale past a core.** Parallel readers overlap I/O, not CPU — the
-client decodes in JavaScript on one thread. Throughput plateaus around 4 readers
-(measured 3.10M rows/s at 4 and 3.11M at 16).
+**The timestamp column dominates the scan, and how much depends on the link.** The
+designated timestamp is Gorilla encoded, so it cannot be handed over as a view and is
+unpacked per value with BigInt arithmetic; every other fixed-width column is zero
+copy. Casting it to LONG in SQL sidesteps that at the cost of more wire bytes, which
+is the right trade next to the database and the wrong one over a thin link. Measured
+three ways, same table:
 
-**The timestamp column dominates the scan.** The designated timestamp is Gorilla
-encoded, so it cannot be handed over as a view and is unpacked per value with BigInt
-arithmetic. Every other fixed-width column is zero copy. The scan tab's `columns`
-control trades this off: `all` 2.5M rows/s, `ts as epoch long` 6.3M, `no timestamp`
-8.7M.
+| environment | `all` | `epoch-long` | `no timestamp` |
+|---|---|---|---|
+| same-AZ cluster, 8 readers | ~11M rows/s | **15.3M** | 18.2M |
+| laptop to localhost, 8 readers | 2.5M | 6.3M | 8.7M |
+| laptop over WAN, 8 readers | 143k | 128k | 173k |
+
+**Reader scaling depends on the projection, which is not obvious.** With `all`, the
+Gorilla decode is a serial bottleneck on one JavaScript thread, so throughput peaks at
+TWO readers and 4/8/16 are all slightly worse. With `epoch-long` the decode is nearly
+free, the limit moves to the network and server, and 8 readers beat 2 by 34%. Tuning
+readers without fixing the projection first measures the wrong thing.
+
+**Slice size does not matter.** On a same-AZ cluster, 40 statements and 1 statement
+landed within noise of each other at every reader count, across three repeated runs.
+`chunk_rows` exists only to keep one statement inside QuestDB's `query.timeout`, not
+to tune throughput.
+
+**A no-BigInt timestamp accessor did not help.** Reading every row's timestamp via
+`getLong()`, via a primitive-returning `getLongNumber()`, and not at all, all came out
+identical (7.67M / 7.64M / 7.60M) next to the database: per-row cost is not the limit
+there. It is worth something on localhost, where it is.
 
 **A chart cannot tick faster than the data becomes visible, and that is a property of
 the WRITER.** With a sender on the default `auto_flush_interval=1000`, the newest

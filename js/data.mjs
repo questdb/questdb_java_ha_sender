@@ -130,7 +130,7 @@ export class Data {
    * for the duration of the scan. The view is invalid once the callback returns, so the tail
    * rows are copied out before then.
    */
-  async scan({ table, rows: limit, readers = 4, chunkRows = 500_000, chunks = 0,
+  async scan({ table, rows: limit, readers = 8, chunkRows = 2_000_000, chunks = 0,
                projection = "all", sample = 10, progressMs = 100 }, onProgress, signal) {
     const workers = Math.max(1, Math.trunc(readers));
 
