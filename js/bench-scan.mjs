@@ -18,7 +18,7 @@
 //
 // The hot path is deliberately identical to the app's: count rows, touch no values.
 import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { connectQwpNodeClient } from "@questdb/nodejs-client";
 import { scanChunks } from "./queries.mjs";
 
 const argv = process.argv.slice(2);
@@ -38,21 +38,6 @@ const chunkSizes = flag("chunks", "500000,2000000,5000000,20000000")
 const readerCounts = flag("readers", "1,2,4,8,16")
   .split(",").map(Number).filter(Number.isFinite);
 const tokenFile = flag("token-file", process.env.QDB_TOKEN_FILE ?? null);
-
-// --client takes the package manager out of the comparison entirely.
-//
-// pnpm materialises a `file:` dependency as a HARD-LINKED COPY under node_modules/.pnpm, so
-// rebuilding the client repo does not reach the app: the rebuild writes new files, which
-// breaks the link, and `pnpm install --force` will not re-resolve a dependency whose version
-// has not changed. An A/B run that way silently compares a build against itself. npm
-// symlinks instead, so the same instructions behave differently on different machines.
-// Importing the built bundle by path sidesteps all of it.
-//
-//   --client ~/nodejs-questdb-client/packages/nodejs-client/dist/es/index.mjs
-const clientPath = flag("client", process.env.QDB_CLIENT ?? null);
-const { connectQwpNodeClient } = clientPath
-  ? await import(resolve(clientPath.replace(/^~/, process.env.HOME ?? "~")))
-  : await import("@questdb/nodejs-client");
 const token = tokenFile ? readFileSync(tokenFile, "utf8").trim() : null;
 
 const poolMax = Math.max(...readerCounts);
@@ -61,7 +46,6 @@ const conf = token
   : `ws::addr=${addrs};query_pool_max=${poolMax};`;
 
 console.log(`${table} (${projection}), last ${rows.toLocaleString("en-US")} rows, ${addrs}`);
-console.log(`client: ${clientPath ?? "@questdb/nodejs-client (resolved from node_modules)"}`);
 const db = await connectQwpNodeClient(conf);
 
 /** One scan at a given slice size and reader count. Mirrors Data.scan's work queue. */
